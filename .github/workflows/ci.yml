@@ -24,4 +24,5 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils
           cargo build --release
           curl -sSL -o sample.pdf https://www.rfc-editor.org/rfc/rfc9110.pdf
-          ./scripts/check_with_poppler.sh sample.pdf
+          curl -sSL -o small.pdf https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf
+          ./scripts/check_with_poppler.sh sample.pdf small.pdf
