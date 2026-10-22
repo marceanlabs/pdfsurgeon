@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Check output with an independent reader
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils
+          cargo build --release
+          curl -sSL -o sample.pdf https://www.rfc-editor.org/rfc/rfc9110.pdf
+          ./scripts/check_with_poppler.sh sample.pdf
