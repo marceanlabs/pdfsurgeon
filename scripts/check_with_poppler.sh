@@ -15,6 +15,8 @@ command -v pdfinfo >/dev/null || { echo "needs poppler: apt install poppler-util
 work=$(mktemp -d)
 trap 'mv "$work" "${TMPDIR:-/tmp}/pdfsurgeon-check-$(date +%s)"' EXIT
 
+first_total=$("$binary" info "$1" | awk '/^pages:/ {print $2}')
+
 status=0
 for input in "$@"; do
   name=$(basename "$input" .pdf)
@@ -49,5 +51,17 @@ for input in "$@"; do
 
   echo "  parts: $(find "$work/$name-parts" -name '*.pdf' | wc -l) files, warnings checked"
 done
+
+# With two or more inputs, also assemble a mixed document and check that too.
+if [ "$#" -ge 2 ]; then
+  first_file=$1
+  "$binary" assemble -o "$work/mixed.pdf" "$first_file:1-2" "$2:1" "$first_file:$first_total"
+  if pdfinfo "$work/mixed.pdf" 2>&1 | grep -qi "syntax warning"; then
+    echo "assemble: FAIL  poppler complains about the mixed document"
+    status=1
+  else
+    echo "assemble: clean, $(pdfinfo "$work/mixed.pdf" | awk '/^Pages:/ {print $2}') pages"
+  fi
+fi
 
 exit $status

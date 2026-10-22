@@ -69,7 +69,7 @@ fn run_cli(args: &[&str]) {
         .args(args)
         .status()
         .unwrap();
-    assert!(status.success(), "pdfx {args:?} failed");
+    assert!(status.success(), "pdfsurgeon {args:?} failed");
 }
 
 fn pages_of(path: &Path) -> usize {
@@ -264,6 +264,71 @@ fn bad_page_spec_is_rejected_without_writing() {
             "9",
             "-o",
             out.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(!out.exists());
+}
+
+#[test]
+fn assemble_takes_pages_from_several_files_in_order() {
+    let dir = scratch("assemble");
+    let a = dir.join("a.pdf");
+    let b = dir.join("b.pdf");
+    let out = dir.join("joined.pdf");
+    make_doc(&a, &["a1", "a2", "a3"]);
+    make_doc(&b, &["b1", "b2"]);
+
+    run_cli(&[
+        "assemble",
+        "-o",
+        out.to_str().unwrap(),
+        &format!("{}:1-2", a.display()),
+        &format!("{}:2", b.display()),
+        &format!("{}:3", a.display()),
+    ]);
+
+    assert_eq!(pages_of(&out), 4);
+    assert!(text_of(&out, 1).contains("a1"));
+    assert!(text_of(&out, 2).contains("a2"));
+    assert!(text_of(&out, 3).contains("b2"));
+    assert!(text_of(&out, 4).contains("a3"));
+}
+
+#[test]
+fn assemble_can_reorder_within_one_file() {
+    let dir = scratch("reorder");
+    let file = dir.join("three.pdf");
+    let out = dir.join("reordered.pdf");
+    make_doc(&file, &["one", "two", "three"]);
+
+    run_cli(&[
+        "assemble",
+        "-o",
+        out.to_str().unwrap(),
+        &format!("{}:3,1", file.display()),
+    ]);
+
+    assert_eq!(pages_of(&out), 2);
+    assert!(text_of(&out, 1).contains("three"));
+    assert!(text_of(&out, 2).contains("one"));
+}
+
+#[test]
+fn assemble_refuses_a_page_that_does_not_exist() {
+    let dir = scratch("assemble-bad");
+    let file = dir.join("two.pdf");
+    let out = dir.join("never.pdf");
+    make_doc(&file, &["x", "y"]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_pdfsurgeon"))
+        .args([
+            "assemble",
+            "-o",
+            out.to_str().unwrap(),
+            &format!("{}:7", file.display()),
         ])
         .status()
         .unwrap();

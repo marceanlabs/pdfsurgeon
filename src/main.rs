@@ -14,6 +14,7 @@ pdfsurgeon - page level surgery for PDF files
 USAGE:
     pdfsurgeon info <file>
     pdfsurgeon merge -o <out.pdf> <in1.pdf> <in2.pdf> ...
+    pdfsurgeon assemble -o <out.pdf> <file[:pages]> <file[:pages]> ...
     pdfsurgeon split <file> [--out <dir>]
     pdfsurgeon select <file> --pages <spec> -o <out.pdf>
     pdfsurgeon rotate <file> --pages <spec> --angle <deg> -o <out.pdf>
@@ -22,6 +23,9 @@ PAGE SPECS:
     1        a single page
     1-4      a range, inclusive
     1,3-5,9  a list of either
+
+assemble takes pages from any number of files, in the order given:
+    pdfsurgeon assemble -o out.pdf report.pdf:1-3 appendix.pdf invoices.pdf:2
 
 Angles are multiples of 90 and are added to any rotation a page already has.
 ";
@@ -54,6 +58,11 @@ fn run() -> Res<()> {
             let out = out.ok_or("merge needs -o <out.pdf>")?;
             let paths: Vec<PathBuf> = inputs.iter().map(PathBuf::from).collect();
             merge(&paths, &out)
+        }
+        "assemble" => {
+            let (out, inputs) = take_out(&args[1..])?;
+            let out = out.ok_or("assemble needs -o <out.pdf>")?;
+            assemble(&inputs, &out)
         }
         "split" => {
             let (out, rest) = take_out(&args[1..])?;
@@ -246,30 +255,40 @@ fn split(path: &Path, out_dir: Option<PathBuf>) -> Res<()> {
     Ok(())
 }
 
-/// Build a new document containing only the given pages of `source`, by
-/// copying the object graph each page can reach. Nothing else travels over,
-/// so no dangling reference can exist in the result and nothing needs pruning.
+/// Build a new document containing only the given pages of one source.
 fn extract_pages(source: &Document, page_ids: &[ObjectId]) -> Document {
-    let mut out = Document::with_version(&source.version);
+    let pages: Vec<(usize, ObjectId)> = page_ids.iter().map(|id| (0usize, *id)).collect();
+    extract_from(std::slice::from_ref(source), &pages)
+}
+
+/// Takes pages from several documents, in the order listed, and builds a new
+/// document holding only what those pages can reach. Nothing else travels
+/// over, so no dangling reference can exist in the result.
+fn extract_from(sources: &[Document], pages: &[(usize, ObjectId)]) -> Document {
+    let version = sources
+        .first()
+        .map(|d| d.version.clone())
+        .unwrap_or_else(|| "1.5".to_string());
+    let mut out = Document::with_version(version);
     let mut next: u32 = 1;
     let pages_id = (next, 0);
     next += 1;
 
-    let mut map: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
-    let mut queue: Vec<ObjectId> = Vec::new();
+    let mut map: BTreeMap<(usize, ObjectId), ObjectId> = BTreeMap::new();
+    let mut queue: Vec<(usize, ObjectId)> = Vec::new();
 
-    for page in page_ids {
-        if map.contains_key(page) {
+    for key in pages {
+        if map.contains_key(key) {
             continue;
         }
-        map.insert(*page, (next, 0));
+        map.insert(*key, (next, 0));
         next += 1;
-        queue.push(*page);
+        queue.push(*key);
     }
 
-    while let Some(old) = queue.pop() {
-        let new = map[&old];
-        let Ok(mut object) = source.get_object(old).cloned() else {
+    while let Some(key) = queue.pop() {
+        let new = map[&key];
+        let Ok(mut object) = sources[key.0].get_object(key.1).cloned() else {
             continue;
         };
         if let Object::Dictionary(dict) = &mut object
@@ -278,20 +297,20 @@ fn extract_pages(source: &Document, page_ids: &[ObjectId]) -> Document {
             // The parent is provided by the new page tree, not copied.
             dict.remove(b"Parent");
         }
-        remap(&mut object, &mut map, &mut queue, &mut next);
+        remap(&mut object, key.0, &mut map, &mut queue, &mut next);
         out.objects.insert(new, object);
     }
 
-    let kids: Vec<Object> = page_ids
+    let kids: Vec<Object> = pages
         .iter()
-        .map(|id| Object::Reference(map[id]))
+        .map(|key| Object::Reference(map[key]))
         .collect();
     out.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {
             "Type" => "Pages",
             "Kids" => kids,
-            "Count" => page_ids.len() as i64,
+            "Count" => pages.len() as i64,
         }),
     );
 
@@ -305,40 +324,84 @@ fn extract_pages(source: &Document, page_ids: &[ObjectId]) -> Document {
 }
 
 /// Rewrite every reference in `object` to point into the new document,
-/// queuing any object that has not been copied yet.
+/// queuing any object that has not been copied yet. `src` is the index of the
+/// document the object came from, because ids are only unique within a source.
 fn remap(
     object: &mut Object,
-    map: &mut BTreeMap<ObjectId, ObjectId>,
-    queue: &mut Vec<ObjectId>,
+    src: usize,
+    map: &mut BTreeMap<(usize, ObjectId), ObjectId>,
+    queue: &mut Vec<(usize, ObjectId)>,
     next: &mut u32,
 ) {
     match object {
         Object::Reference(id) => {
             let fresh = (*next, 0);
-            let assigned = *map.entry(*id).or_insert_with(|| {
+            let assigned = *map.entry((src, *id)).or_insert_with(|| {
                 *next += 1;
-                queue.push(*id);
+                queue.push((src, *id));
                 fresh
             });
             *object = Object::Reference(assigned);
         }
         Object::Dictionary(dict) => {
             for (_, value) in dict.iter_mut() {
-                remap(value, map, queue, next);
+                remap(value, src, map, queue, next);
             }
         }
         Object::Array(items) => {
             for item in items.iter_mut() {
-                remap(item, map, queue, next);
+                remap(item, src, map, queue, next);
             }
         }
         Object::Stream(stream) => {
             for (_, value) in stream.dict.iter_mut() {
-                remap(value, map, queue, next);
+                remap(value, src, map, queue, next);
             }
         }
         _ => {}
     }
+}
+
+/// Assemble `file[:pages]` pieces, in the order given, into one document.
+fn assemble(inputs: &[String], out: &Path) -> Res<()> {
+    if inputs.is_empty() {
+        return Err("assemble needs at least one input".into());
+    }
+
+    let mut sources: Vec<Document> = Vec::new();
+    let mut pages: Vec<(usize, ObjectId)> = Vec::new();
+
+    for piece in inputs {
+        let (path, spec) = match piece.rsplit_once(':') {
+            Some((path, spec)) if !path.is_empty() && !spec.is_empty() => (path, Some(spec)),
+            _ => (piece.as_str(), None),
+        };
+        let doc = Document::load(path)?;
+        let ids: Vec<ObjectId> = {
+            let by_number = doc.get_pages();
+            let total = by_number.len() as u32;
+            let wanted: Vec<u32> = match spec {
+                Some(spec) => parse_pages(spec, total)?,
+                None => (1..=total).collect(),
+            };
+            let mut ids: Vec<ObjectId> = Vec::with_capacity(wanted.len());
+            for n in wanted {
+                let id = by_number
+                    .get(&n)
+                    .copied()
+                    .ok_or_else(|| format!("{path}: page {n} is missing"))?;
+                ids.push(id);
+            }
+            ids
+        };
+        let index = sources.len();
+        pages.extend(ids.into_iter().map(|id| (index, id)));
+        sources.push(doc);
+    }
+
+    let mut doc = extract_from(&sources, &pages);
+    doc.save(out)?;
+    Ok(())
 }
 
 fn select(path: &Path, spec: &str, out: &Path) -> Res<()> {

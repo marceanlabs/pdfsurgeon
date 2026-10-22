@@ -22,6 +22,7 @@ page size: 595 x 841 pt
 ```
 pdfsurgeon info <file>
 pdfsurgeon merge -o <out.pdf> <in1.pdf> <in2.pdf> ...
+pdfsurgeon assemble -o <out.pdf> <file[:pages]> <file[:pages]> ...
 pdfsurgeon split <file> [--out <dir>]
 pdfsurgeon select <file> --pages <spec> -o <out.pdf>
 pdfsurgeon rotate <file> --pages <spec> --angle <deg> -o <out.pdf>
@@ -30,6 +31,13 @@ pdfsurgeon rotate <file> --pages <spec> --angle <deg> -o <out.pdf>
 Page specs accept a page, a range, or a list of either: `1`, `1-4`, `1,3-5,9`.
 Angles are multiples of 90 and add to whatever rotation a page already carries,
 so rotating twice by 90 leaves the page at 180 rather than resetting it.
+
+`assemble` is the general case of `merge`: it takes pages from any number of
+files, in the order you list them, and can reorder inside a file.
+
+```
+pdfsurgeon assemble -o bid.pdf cover.pdf report.pdf:2-4 appendix.pdf invoice.pdf:1
+```
 
 ## Build
 
@@ -51,6 +59,9 @@ than trusting the writer:
 | Rotation adds up across runs | `rotate_sets_and_accumulates_rotation` |
 | A bad page spec exits non-zero and writes nothing | `bad_page_spec_is_rejected_without_writing` |
 | An `OpenAction` into a removed page is dropped | `open_action_to_a_removed_page_is_dropped` |
+| Pages from several files assemble in the order listed | `assemble_takes_pages_from_several_files_in_order` |
+| One file can be reordered in place | `assemble_can_reorder_within_one_file` |
+| A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
 
 Beyond the test suite, the tool was checked against real files from two
