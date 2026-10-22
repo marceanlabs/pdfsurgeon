@@ -1,10 +1,13 @@
 [package]
 name = "pdfsurgeon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+rust-version = "1.85"
 description = "Page level surgery for PDF files: merge, split, select and rotate, with output that other readers do not complain about"
 license = "Apache-2.0"
 repository = "https://github.com/wlkr73/pdfsurgeon"
+homepage = "https://github.com/wlkr73/pdfsurgeon"
+documentation = "https://docs.rs/pdfsurgeon"
 readme = "README.md"
 keywords = ["pdf", "cli", "merge", "split", "rotate"]
 categories = ["command-line-utilities"]
