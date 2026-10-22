@@ -47,6 +47,35 @@ files, in the order you list them, and can reorder inside a file.
 pdfsurgeon assemble -o bid.pdf cover.pdf report.pdf:2-4 appendix.pdf invoice.pdf:1
 ```
 
+## As a library
+
+The same page-graph rebuild is available as an API, for programs that would
+rather add a dependency than shell out:
+
+```rust
+use pdfsurgeon::{Document, PageSpec, Piece};
+
+let doc = Document::load("report.pdf")?;
+let keep = PageSpec::parse("1-3,7", doc.get_pages().len() as u32)?;
+let mut trimmed = pdfsurgeon::select(&doc, keep.pages())?;
+trimmed.save("extract.pdf")?;
+
+// pages from several files, in the order you list them
+let mut bid = pdfsurgeon::assemble(
+    &[cover, report, appendix],
+    &[
+        Piece { source: 0, pages: vec![1] },
+        Piece { source: 1, pages: vec![2, 3, 4] },
+        Piece::all(2, 6),
+    ],
+)?;
+```
+
+`merge`, `assemble`, `select`, `rotate` and `info` are all public, along with
+`PageSpec`, and errors are a single `pdfsurgeon::Error` enum that implements
+`std::error::Error`. `lopdf::Document` is re-exported, so callers do not have to
+match the library version themselves. Docs: <https://docs.rs/pdfsurgeon>.
+
 ## Build
 
 ```
