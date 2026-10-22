@@ -131,7 +131,7 @@ fn cmd_merge(inputs: &[String], out: &Path) -> Res<()> {
     for input in inputs {
         docs.push(Document::load(input)?);
     }
-    let mut merged = pdfsurgeon::merge(&docs)?;
+    let mut merged = pdfsurgeon::merge(docs)?;
     merged.save(out)?;
     Ok(())
 }
@@ -200,7 +200,6 @@ fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path) -> Res<()> {
     let total = doc.get_pages().len() as u32;
     let pages = PageSpec::parse(spec, total)?;
     pdfsurgeon::rotate(&mut doc, pages.pages(), angle)?;
-    doc.renumber_objects();
     doc.save(out)?;
     Ok(())
 }

@@ -124,6 +124,25 @@ minutes.
 `merge` keeps everything from every input and builds one page tree over all of
 them, so links between the merged files' own pages keep working.
 
+## Speed
+
+Measured on a 970 page, 8.6 MB document (RFC 9110 concatenated five times), best
+of two runs, warm cache, same machine, against `qpdf 12.3.2` and `mutool 1.27`:
+
+| Operation | pdfsurgeon | qpdf | mutool |
+|---|---|---|---|
+| Split every page into its own file | 1.07 s | 4.61 s | not supported |
+| Merge two copies (1940 pages) | 0.71 s | 5.85 s | 1.25 s |
+| Select 3 pages | 0.24 s | 0.22 s | 0.03 s |
+| Rotate one page | 0.33 s | 2.57 s | 0.01 s |
+
+The pattern is deliberate: the work here is bulk page surgery, and that is where
+this wins. Single page edits against a large file are dominated by parsing and
+writing the whole document, which `mutool` avoids by not going through a general
+object model, so it stays ahead there.
+
+`cargo run --release --example phases -- <file.pdf>` repeats the phase timing.
+
 ## What it deliberately does not do
 
 - **No decryption.** Encrypted files are reported, not opened.

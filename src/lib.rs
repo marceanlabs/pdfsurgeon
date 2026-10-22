@@ -252,16 +252,88 @@ pub fn assemble(sources: &[Document], pieces: &[Piece]) -> Result<Document> {
 }
 
 /// Every page of every input, in order.
-pub fn merge(sources: &[Document]) -> Result<Document> {
+///
+/// Consumes the inputs: their objects are moved into the result rather than
+/// copied, which is what keeps a large merge cheap.
+pub fn merge(sources: Vec<Document>) -> Result<Document> {
     if sources.is_empty() {
         return Err(Error::Empty);
     }
-    let pieces: Vec<Piece> = sources
-        .iter()
-        .enumerate()
-        .map(|(index, doc)| Piece::all(index, doc.get_pages().len() as u32))
-        .collect();
-    assemble(sources, &pieces)
+    let mut out = Document::with_version(sources[0].version.clone());
+    let mut offset: u32 = 0;
+    let mut page_ids: Vec<ObjectId> = Vec::new();
+
+    for doc in sources {
+        let by_number = doc.get_pages();
+        page_ids.extend(by_number.values().map(|(n, g)| (n + offset, *g)));
+
+        for (id, mut object) in doc.objects {
+            match object.type_name().unwrap_or(b"") {
+                // The output owns one page tree and one catalogue.
+                b"Catalog" | b"Pages" => continue,
+                _ => {}
+            }
+            shift_refs(&mut object, offset);
+            out.objects.insert((id.0 + offset, id.1), object);
+        }
+        offset += doc.max_id + 1;
+    }
+
+    // Every page needs the new tree as its parent, and ids were inserted
+    // directly, so the next free id comes from the map.
+    out.max_id = out.objects.keys().map(|(n, _)| *n).max().unwrap_or(0);
+    let pages_id = (out.max_id + 1, 0);
+    out.max_id += 1;
+    for id in &page_ids {
+        if let Ok(dict) = out.get_dictionary_mut(*id) {
+            dict.set("Parent", pages_id);
+        }
+    }
+
+    let kids: Vec<Object> = page_ids.iter().map(|id| Object::Reference(*id)).collect();
+    let count = kids.len() as i64;
+    out.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => count,
+        }),
+    );
+
+    let catalog_id = out.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    out.trailer.set("Root", catalog_id);
+    Ok(out)
+}
+
+/// Add `offset` to every object number inside `object`, so references keep
+/// pointing at the same objects after their ids have moved.
+fn shift_refs(object: &mut Object, offset: u32) {
+    if offset == 0 {
+        return;
+    }
+    match object {
+        Object::Reference(id) => id.0 += offset,
+        Object::Dictionary(dict) => {
+            for (_, value) in dict.iter_mut() {
+                shift_refs(value, offset);
+            }
+        }
+        Object::Array(items) => {
+            for item in items.iter_mut() {
+                shift_refs(item, offset);
+            }
+        }
+        Object::Stream(stream) => {
+            for (_, value) in stream.dict.iter_mut() {
+                shift_refs(value, offset);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Add `angle` degrees to the rotation of `pages`, in place.
@@ -472,7 +544,7 @@ mod tests {
     fn merge_keeps_page_order_and_rewrites_ids() {
         let a = doc(&["a1", "a2"]);
         let b = doc(&["b1"]);
-        let merged = merge(&[a, b]).unwrap();
+        let merged = merge(vec![a, b]).unwrap();
         assert_eq!(merged.get_pages().len(), 3);
         assert_eq!(merged.extract_text(&[1]).unwrap().trim(), "a1");
         assert_eq!(merged.extract_text(&[3]).unwrap().trim(), "b1");
