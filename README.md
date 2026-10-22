@@ -8,6 +8,14 @@ warn**. Page removal in most libraries leaves dangling destinations behind, and
 readers then report things like `Annotation destination array is too short`. This
 one cleans up after itself.
 
+## Install
+
+```
+cargo install pdfsurgeon
+```
+
+Or take a prebuilt binary from the [releases page](https://github.com/wlkr73/pdfsurgeon/releases) (Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64).
+
 ```
 $ pdfsurgeon info report.pdf
 file:      report.pdf
