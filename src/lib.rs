@@ -442,6 +442,27 @@ pub fn info(doc: &Document) -> Info {
     }
 }
 
+/// One document per page, in page order.
+///
+/// The same work as calling [`select`] once per page, but the name tree and the
+/// stream check are read once instead of once per page, which is most of the
+/// cost on a large file.
+pub fn split(doc: &Document) -> Result<Vec<Document>> {
+    if doc.is_encrypted() {
+        return Err(Error::Encrypted);
+    }
+    check_streams(doc)?;
+    let by_number = doc.get_pages();
+    let names = named_destinations(doc);
+    let names = std::slice::from_ref(&names);
+    let source = std::slice::from_ref(doc);
+    let mut pages = Vec::with_capacity(by_number.len());
+    for id in by_number.values() {
+        pages.push(extract_with_names(source, &[(0, *id)], names));
+    }
+    Ok(pages)
+}
+
 /// Build a new document containing only `pages` of `doc`, in the order given.
 ///
 /// Page numbers are one based. The result holds only what those pages can
@@ -594,8 +615,11 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
 
         for (id, mut object) in doc.objects {
             match object.type_name().unwrap_or(b"") {
-                // The output owns one page tree and one catalogue.
-                b"Catalog" | b"Pages" => continue,
+                // The output owns one page tree and one catalogue, and it
+                // writes its own cross reference table: a source's `/XRef`
+                // stream describes the byte layout of a file that no longer
+                // exists, and points at the catalogue we just replaced.
+                b"Catalog" | b"Pages" | b"XRef" => continue,
                 _ => {}
             }
             if let Some(attributes) = carried.get(&id) {
@@ -793,12 +817,22 @@ pub fn rotate(doc: &mut Document, pages: &[u32], angle: i64) -> Result<()> {
 /// those pages can reach. Nothing else travels over, so no dangling reference
 /// can exist in the result.
 fn extract_from(sources: &[Document], keys: &[(usize, ObjectId)]) -> Document {
+    let names: Vec<BTreeMap<Vec<u8>, Object>> = sources.iter().map(named_destinations).collect();
+    extract_with_names(sources, keys, &names)
+}
+
+/// The body of [`extract_from`], with the named destinations already read so a
+/// caller that extracts many times from one document pays for them once.
+fn extract_with_names(
+    sources: &[Document],
+    keys: &[(usize, ObjectId)],
+    names: &[BTreeMap<Vec<u8>, Object>],
+) -> Document {
     let version = sources
         .first()
         .map(|d| d.version.clone())
         .unwrap_or_else(|| "1.5".to_string());
     let mut out = Document::with_version(version);
-    let names: Vec<BTreeMap<Vec<u8>, Object>> = sources.iter().map(named_destinations).collect();
     let mut kept_by_source: BTreeMap<usize, BTreeSet<ObjectId>> = BTreeMap::new();
     for (source, id) in keys {
         kept_by_source.entry(*source).or_default().insert(*id);

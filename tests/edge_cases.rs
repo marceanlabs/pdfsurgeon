@@ -921,6 +921,77 @@ fn select_drops_a_named_destination_that_points_at_a_removed_page() {
     }
 }
 
+#[test]
+fn merge_drops_the_source_cross_reference_stream() {
+    // A producer that writes cross reference streams leaves an object of type
+    // /XRef in the file. It describes the byte layout of that file and points
+    // at its catalogue, so copying it into a merged document leaves a reference
+    // to a catalogue that no longer exists.
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Object, Stream, dictionary};
+
+    let dir = scratch("xref-object");
+    let file = dir.join("stream-xref.pdf");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 24.into()]),
+            Operation::new("Td", vec![72.into(), 700.into()]),
+            Operation::new("Tj", vec![Object::string_literal("page")]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let stream = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => stream,
+        "Resources" => resources,
+        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page)],
+            "Count" => 1i64,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    doc.save(&file).unwrap();
+
+    let source = Document::load(&file).unwrap();
+    assert!(
+        source
+            .objects
+            .values()
+            .any(|object| matches!(object.type_name(), Ok(name) if name == b"XRef")),
+        "fixture should contain a cross reference stream"
+    );
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&file).unwrap(),
+        Document::load(&file).unwrap(),
+    ])
+    .unwrap();
+    assert!(
+        !merged
+            .objects
+            .values()
+            .any(|object| matches!(object.type_name(), Ok(name) if name == b"XRef")),
+        "a stale cross reference stream should not be copied"
+    );
+    assert_no_dangling_references(&merged);
+    assert_eq!(merged.get_pages().len(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // command line behaviour
 // ---------------------------------------------------------------------------
@@ -1185,6 +1256,69 @@ fn a_path_that_is_not_valid_utf8_still_opens() {
         String::from_utf8_lossy(&status.stderr)
     );
     assert!(String::from_utf8_lossy(&status.stdout).contains("pages:     4"));
+}
+
+#[test]
+fn the_version_is_reported() {
+    let out = cli(&["--version"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("pdfsurgeon {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn merging_many_inputs_keeps_every_page_and_every_bookmark() {
+    let dir = scratch("many-inputs");
+    let file = dir.join("linked.pdf");
+    linked_document(&file);
+
+    let sources: Vec<Document> = (0..30).map(|_| Document::load(&file).unwrap()).collect();
+    let merged = pdfsurgeon::merge(sources).unwrap();
+    assert_eq!(merged.get_pages().len(), 60);
+    assert_no_dangling_references(&merged);
+
+    let catalog = merged.catalog().unwrap();
+    let root = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+    assert_eq!(
+        merged
+            .get_dictionary(root)
+            .unwrap()
+            .get(b"Count")
+            .unwrap()
+            .as_i64()
+            .unwrap(),
+        30
+    );
+
+    // Walk the joined chain and count it: one bookmark per input.
+    let mut current = merged
+        .get_dictionary(root)
+        .unwrap()
+        .get(b"First")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let mut seen = 0;
+    loop {
+        let dict = merged.get_dictionary(current).unwrap();
+        assert_eq!(
+            dict.get(b"Parent").unwrap().as_reference().unwrap(),
+            root,
+            "every top level bookmark must belong to the one root"
+        );
+        seen += 1;
+        match dict
+            .get(b"Next")
+            .ok()
+            .and_then(|next| next.as_reference().ok())
+        {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    assert_eq!(seen, 30);
 }
 
 #[test]

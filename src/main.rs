@@ -12,6 +12,7 @@ const USAGE: &str = "\
 pdfsurgeon - page level surgery for PDF files
 
 USAGE:
+    pdfsurgeon --version
     pdfsurgeon info <file>
     pdfsurgeon merge -o <out.pdf> <in1.pdf> <in2.pdf> ...
     pdfsurgeon assemble -o <out.pdf> <file[:pages]> <file[:pages]> ...
@@ -52,6 +53,10 @@ fn run() -> Res<()> {
     match command.to_str().unwrap_or("") {
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
+            Ok(())
+        }
+        "-V" | "--version" | "version" => {
+            println!("pdfsurgeon {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         "info" => {
@@ -186,13 +191,12 @@ fn load_plain(path: &Path) -> Res<Document> {
 /// place, so a failed write cannot leave a half written document, and writing
 /// over the input file cannot destroy it.
 fn save(doc: &mut Document, out: &Path) -> Res<()> {
+    if let Err(err) = verify(doc) {
+        return Err(format!("{}: {err}; nothing was written", out.display()).into());
+    }
     let temp = temp_path(out);
     doc.save(&temp)
         .map_err(|err| format!("{}: {err}", out.display()))?;
-    if let Err(err) = verify(&temp) {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("{}: {err}; nothing was written", out.display()).into());
-    }
     fs::rename(&temp, out).map_err(|err| {
         let _ = fs::remove_file(&temp);
         format!("{}: {err}", out.display())
@@ -200,12 +204,17 @@ fn save(doc: &mut Document, out: &Path) -> Res<()> {
     Ok(())
 }
 
-/// Read back what was just written and check the two things that make it
-/// usable: it loads, and every reference in it lands on an object. Writing a
-/// file that only opens by luck is the one failure mode worth spending a
-/// second parse on.
-fn verify(path: &Path) -> Res<()> {
-    let doc = Document::load(path)?;
+/// How many digits a page number needs in a split file name, never fewer than
+/// three.
+fn page_width(total: u32) -> usize {
+    total.to_string().len().max(3)
+}
+
+/// Check the document that is about to be written: its catalogue owns a page
+/// tree, every reference in it lands on an object, and no stream is missing its
+/// length. Walking the model costs milliseconds; parsing the file again to ask
+/// the same questions cost a second on a large one.
+fn verify(doc: &Document) -> Res<()> {
     let catalog = doc.catalog()?;
     if catalog.get(b"Pages").is_err() {
         return Err("the new catalogue has no page tree".into());
@@ -337,9 +346,13 @@ fn cmd_split(path: &Path, out_dir: Option<PathBuf>) -> Res<()> {
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "page".to_string());
 
-    for page in 1..=total {
-        let mut single = pdfsurgeon::select(&source, &[page])?;
-        save(&mut single, &dir.join(format!("{stem}-{page:03}.pdf")))?;
+    // Three digits reads well up to a few hundred pages; a document with more
+    // pages than that gets the width it needs, so the files still sort.
+    let width = page_width(total);
+    for (index, mut single) in pdfsurgeon::split(&source)?.into_iter().enumerate() {
+        let page = index as u32 + 1;
+        let name = format!("{stem}-{page:0width$}.pdf");
+        save(&mut single, &dir.join(name))?;
     }
     Ok(())
 }
@@ -358,4 +371,18 @@ fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path) -> Res<()> {
     let pages = PageSpec::parse(spec, total)?;
     pdfsurgeon::rotate(&mut doc, pages.pages(), angle)?;
     save(&mut doc, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_width;
+
+    #[test]
+    fn split_names_keep_three_digits_until_the_page_count_needs_more() {
+        assert_eq!(page_width(1), 3);
+        assert_eq!(page_width(194), 3);
+        assert_eq!(page_width(999), 3);
+        assert_eq!(page_width(1000), 4);
+        assert_eq!(page_width(25_000), 5);
+    }
 }

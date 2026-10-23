@@ -28,16 +28,16 @@ of two runs, warm cache, same machine, against `qpdf 12.3.2` and `mutool 1.27`:
 
 | Operation | pdfsurgeon | qpdf | mutool |
 |---|---|---|---|
-| Split every page into its own file | 1.07 s | 4.61 s | not supported |
-| Merge two copies (1940 pages) | 0.71 s | 5.85 s | 1.25 s |
-| Select 3 pages | 0.24 s | 0.22 s | 0.03 s |
-| Rotate one page | 0.33 s | 2.57 s | 0.01 s |
+| Split every page into its own file | 0.89 s | 4.81 s | not supported |
+| Merge two copies (1,940 pages) | 0.98 s | 6.06 s | 1.32 s |
+| Select 3 pages | 0.27 s | 2.27 s | 0.69 s |
+| Rotate every page (`mutool` has no per-page rotate) | 0.37 s | 2.55 s | 0.01 s |
 
-The work here is bulk page surgery and that is where it wins. Single page edits
-against a large file are dominated by parsing and writing the whole document,
+The work here is bulk page surgery and that is where it wins. A single page edit
+against a large file is dominated by parsing and writing the whole document,
 which `mutool` avoids by not going through a general object model, so it stays
-ahead there. `cargo run --release --example phases -- <file.pdf>` repeats the
-timing.
+ahead on that one. `cargo run --release --example phases -- <file.pdf>` repeats
+the timing.
 
 ```
 $ pdfsurgeon info report.pdf
@@ -51,6 +51,7 @@ page size: 595 x 841 pt
 ## Commands
 
 ```
+pdfsurgeon --version
 pdfsurgeon info <file>
 pdfsurgeon merge -o <out.pdf> <in1.pdf> <in2.pdf> ...
 pdfsurgeon assemble -o <out.pdf> <file[:pages]> <file[:pages]> ...
@@ -58,6 +59,9 @@ pdfsurgeon split <file> [--out <dir>]
 pdfsurgeon select <file> --pages <spec> -o <out.pdf>
 pdfsurgeon rotate <file> --pages <spec> --angle <deg> -o <out.pdf>
 ```
+
+Split names its files `<name>-<page>.pdf` with at least three digits, and more
+when the page count needs them, so they sort beside the original.
 
 Page specs accept a page, a range, or a list of either: `1`, `1-4`, `1,3-5,9`.
 Angles are multiples of 90 and add to whatever rotation a page already carries,
@@ -124,7 +128,7 @@ trusting the writer:
 | A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
 
-`tests/edge_cases.rs` adds 40 more, against page trees written as raw bytes
+`tests/edge_cases.rs` adds 43 more, against page trees written as raw bytes
 because the shapes that break page surgery are the ones a library's own writer
 never produces: attributes inherited from a `Pages` node, a `/Parent` cycle, a
 `/Count` that lies, the same page object listed twice in `/Kids`, a zero page
@@ -160,8 +164,8 @@ an independent reader:
 document from the objects each kept page can reach, renumbering as they go, so
 stale objects, dangling destinations and dead links cannot be carried over.
 That also makes it fast: splitting the 194 page RFC 9110 into 194 single page
-files takes about 0.2 seconds, where deleting pages one at a time took over six
-minutes.
+files takes about a quarter of a second, where deleting pages one at a time
+took over six minutes.
 
 `merge` keeps everything from every input and builds one page tree over all of
 them, so links between the merged files' own pages keep working. The bookmarks
@@ -186,11 +190,12 @@ opens blank, or at the wrong size.
   catalogue, so `/AcroForm`, `/Metadata` and JavaScript from the inputs do not
   travel. Bookmarks and internal links do: names are resolved into page
   references, and nothing is left pointing at a page that is not there.
-- **Nothing is written in place.** Output goes to a temporary file beside the
-  destination, is read back and checked (it must load, its catalogue must own a
-  page tree, every reference in it must land on an object), and only then is it
-  renamed into place. A failed write cannot leave half a document, `-o` may name
-  the input file, and a file that would not open is never left behind.
+- **Nothing is written in place.** The document is checked before it is written
+  (its catalogue must own a page tree, every reference in it must land on an
+  object, no stream may be missing its length), written to a temporary file
+  beside the destination, and renamed into place. A failed write cannot leave
+  half a document, `-o` may name the input file, and a document that would not
+  open is never left behind.
 - **No recompression or font work.** Streams are carried over; the output keeps
   the size of the input apart from the removed pages.
 - **Links into removed pages are dropped.** A file whose links pointed at page 12
