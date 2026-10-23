@@ -25,3 +25,8 @@ jobs:
           cargo build --release
           curl -sSL --max-time 120 -o sample.pdf https://www.rfc-editor.org/rfc/rfc9110.pdf
           ./scripts/check_with_poppler.sh sample.pdf tests/fixtures/two-pages.pdf
+      - name: Check that forms stay fillable
+        run: |
+          cargo build --release
+          python3 -m pip install --quiet pypdf reportlab
+          ./scripts/check_forms.py

@@ -586,6 +586,7 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     let mut page_ids: Vec<ObjectId> = Vec::new();
     // Top level chains of each source outline, in output ids.
     let mut outlines: Vec<(ObjectId, i64)> = Vec::new();
+    let mut forms: Vec<SourceForm> = Vec::new();
 
     for doc in sources {
         let by_number = doc.get_pages();
@@ -607,6 +608,14 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
         page_ids.extend(by_number.values().map(|(n, g)| (n + offset, *g)));
 
         let names = named_destinations(&doc);
+        if let Some(form) = doc
+            .catalog()
+            .ok()
+            .and_then(|catalog| catalog.get(b"AcroForm").ok().cloned())
+            && let Some(form) = read_source_form(&doc, offset, form)
+        {
+            forms.push(form);
+        }
         if let Some(dict) = doc
             .catalog()
             .ok()
@@ -695,6 +704,9 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     }
     if let Some(action) = first_open_action {
         catalog.set("OpenAction", action);
+    }
+    if let Some(acroform) = merge_forms(&mut out, &forms) {
+        catalog.set("AcroForm", acroform);
     }
     let catalog_id = out.add_object(catalog);
     out.trailer.set("Root", catalog_id);
@@ -894,6 +906,15 @@ fn extract_with_names(
             continue;
         };
         if let Object::Dictionary(dict) = &mut object
+            && is_widget(dict)
+        {
+            // The field above this widget lives in the catalogue being
+            // replaced. Keeping the pointer would drag the whole form, and any
+            // page its other widgets sit on, into a document that does not have
+            // those pages.
+            dict.remove(b"Parent");
+        }
+        if let Object::Dictionary(dict) = &mut object
             && dict.get(b"Type").ok().and_then(|t| t.as_name().ok()) == Some(b"Page")
         {
             // The parent is provided by the new page tree, not copied.
@@ -939,10 +960,14 @@ fn extract_with_names(
     } else {
         None
     };
+    let acroform = build_extracted_form(sources, &mut out, &map, keys);
     let mut catalog = dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
     };
+    if let Some(acroform) = acroform {
+        catalog.set("AcroForm", acroform);
+    }
     if let Some(outlines_id) = outlines {
         catalog.set("Outlines", outlines_id);
         if sources[0]
@@ -1170,6 +1195,715 @@ fn write_outline_level(
         .zip(ids.last())
         .map(|(first, last)| (*first, *last));
     (span, visible)
+}
+
+// ---------------------------------------------------------------------------
+// interactive forms
+// ---------------------------------------------------------------------------
+
+/// What one input brings to the merged form: its root fields, in source ids,
+/// and the document level defaults that go with them.
+struct SourceForm {
+    base: u32,
+    fields: Vec<ObjectId>,
+    dr: Option<Object>,
+    da: Option<Object>,
+    q: Option<Object>,
+    need_appearances: bool,
+    sig_flags: i64,
+    xfa: bool,
+}
+
+fn read_source_form(doc: &Document, base: u32, form: Object) -> Option<SourceForm> {
+    let dict = match &form {
+        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        Object::Dictionary(dict) => dict,
+        _ => return None,
+    };
+    let fields = dict
+        .get(b"Fields")
+        .ok()
+        .and_then(|fields| fields.as_array().ok())
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| field.as_reference().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SourceForm {
+        base,
+        fields,
+        dr: dict.get(b"DR").ok().cloned(),
+        da: dict.get(b"DA").ok().cloned(),
+        q: dict.get(b"Q").ok().cloned(),
+        need_appearances: dict
+            .get(b"NeedAppearances")
+            .ok()
+            .and_then(|flag| flag.as_bool().ok())
+            .unwrap_or(false),
+        sig_flags: dict
+            .get(b"SigFlags")
+            .ok()
+            .and_then(|flags| flags.as_i64().ok())
+            .unwrap_or(0),
+        // An XFA form is an XML document the viewer renders instead of the
+        // pages; there is nothing sane to merge, so its form is left behind.
+        xfa: dict.get(b"XFA").is_ok(),
+    })
+}
+
+/// Carry the interactive form of every input into the merged document.
+///
+/// Every field object was copied with the rest, so all that has to be done is to
+/// write one `/AcroForm` that owns them: one `/Fields` array, unique names among
+/// the roots, and one default resource dictionary whose font names do not clash.
+/// Two documents that both call a font `/Helv` are fine when it is the same
+/// font; when it is not, the later one is renamed and the appearance strings
+/// that named it are rewritten to match.
+fn merge_forms(out: &mut Document, forms: &[SourceForm]) -> Option<ObjectId> {
+    let usable: Vec<&SourceForm> = forms
+        .iter()
+        .filter(|form| !form.xfa && !form.fields.is_empty())
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+
+    let mut roots: Vec<(usize, ObjectId)> = Vec::new();
+    for (index, form) in usable.iter().enumerate() {
+        for id in &form.fields {
+            let shifted = (id.0 + form.base, id.1);
+            if !out.objects.contains_key(&shifted) {
+                continue;
+            }
+            strip_actions(out, shifted, 0);
+            roots.push((index, shifted));
+        }
+    }
+    if roots.is_empty() {
+        return None;
+    }
+    let ids: Vec<ObjectId> = roots.iter().map(|(_, id)| *id).collect();
+    make_root_names_unique(out, &ids);
+    let field_refs: Vec<Object> = ids.iter().map(|id| Object::Reference(*id)).collect();
+
+    let mut groups: Vec<BTreeMap<Vec<u8>, ObjectId>> = Vec::new();
+    for form in &usable {
+        groups.push(font_map(out, form));
+    }
+    let merged = merge_fonts(out, &groups);
+    for (index, renamed) in merged.renames.iter().enumerate() {
+        if renamed.is_empty() {
+            continue;
+        }
+        for (old, new) in renamed {
+            for (owner, id) in &roots {
+                if *owner != index {
+                    continue;
+                }
+                rename_field_font(out, *id, old, new, 0);
+            }
+        }
+    }
+
+    let mut resources = dictionary! {};
+    let mut fonts = Dictionary::new();
+    for (name, id) in &merged.fonts {
+        fonts.set(name.clone(), Object::Reference(*id));
+    }
+    if !fonts.is_empty() {
+        resources.set("Font", fonts);
+    }
+    let mut acroform = dictionary! { "Fields" => field_refs };
+    if !resources.is_empty() {
+        let dr = out.add_object(resources);
+        acroform.set("DR", dr);
+    }
+    let first = usable[0];
+    if let Some(da) = &first.da {
+        acroform.set("DA", da.clone());
+    }
+    if let Some(q) = &first.q {
+        acroform.set("Q", q.clone());
+    }
+    let need_appearances = usable.iter().any(|form| form.need_appearances);
+    if need_appearances {
+        acroform.set("NeedAppearances", true);
+    }
+    let sig_flags = usable
+        .iter()
+        .map(|form| form.sig_flags)
+        .reduce(|a, b| a | b)
+        .unwrap_or(0);
+    if sig_flags != 0 {
+        acroform.set("SigFlags", sig_flags);
+    }
+    Some(out.add_object(acroform))
+}
+
+/// The `/DR /Font` entries of one input, as output ids.
+fn font_map(out: &Document, form: &SourceForm) -> BTreeMap<Vec<u8>, ObjectId> {
+    let mut fonts = BTreeMap::new();
+    let Some(dr) = &form.dr else {
+        return fonts;
+    };
+    let dict = match dr {
+        Object::Reference(id) => out.get_dictionary((id.0 + form.base, id.1)).ok(),
+        // A dictionary written inline in the catalogue was not copied with the
+        // objects, so its fonts are looked up by the ids it holds plus the
+        // input's offset.
+        Object::Dictionary(dict) => Some(dict),
+        _ => None,
+    };
+    let Some(dict) = dict else {
+        return fonts;
+    };
+    let shift = if matches!(dr, Object::Dictionary(_)) {
+        form.base
+    } else {
+        0
+    };
+    let Some(font_dict) = dict
+        .get(b"Font")
+        .ok()
+        .and_then(|fonts| fonts.as_dict().ok())
+    else {
+        return fonts;
+    };
+    for (name, value) in font_dict.iter() {
+        if let Ok((number, generation)) = value.as_reference() {
+            fonts.insert(name.to_vec(), (number + shift, generation));
+        }
+    }
+    fonts
+}
+
+struct MergedFonts {
+    fonts: BTreeMap<Vec<u8>, ObjectId>,
+    /// Per input, the font names that had to change and what they became.
+    renames: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+/// Put the fonts of several inputs into one namespace.
+///
+/// A name that is already taken is kept when both inputs mean the same font;
+/// otherwise the later one gets a new name and its caller rewrites the `/DA`
+/// strings that used the old one.
+fn merge_fonts(out: &Document, groups: &[BTreeMap<Vec<u8>, ObjectId>]) -> MergedFonts {
+    let mut fonts: BTreeMap<Vec<u8>, ObjectId> = BTreeMap::new();
+    let mut renames: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    for group in groups {
+        let mut form_renames = Vec::new();
+        for (name, id) in group {
+            match fonts.get(name) {
+                None => {
+                    fonts.insert(name.clone(), *id);
+                }
+                Some(existing) if existing == id => {}
+                Some(existing) => {
+                    if same_font(out, *existing, *id) {
+                        continue;
+                    }
+                    let new_name = unique_font_name(&fonts, name);
+                    fonts.insert(new_name.clone(), *id);
+                    form_renames.push((name.clone(), new_name));
+                }
+            }
+        }
+        renames.push(form_renames);
+    }
+    MergedFonts { fonts, renames }
+}
+
+fn same_font(out: &Document, a: ObjectId, b: ObjectId) -> bool {
+    let name = |id| {
+        out.get_dictionary(id)
+            .ok()
+            .and_then(|dict| {
+                dict.get(b"BaseFont")
+                    .ok()
+                    .and_then(|font| font.as_name().ok())
+                    .map(<[u8]>::to_vec)
+            })
+            .unwrap_or_default()
+    };
+    let kind = |id| {
+        out.get_dictionary(id)
+            .ok()
+            .and_then(|dict| {
+                dict.get(b"Subtype")
+                    .ok()
+                    .and_then(|kind| kind.as_name().ok())
+                    .map(<[u8]>::to_vec)
+            })
+            .unwrap_or_default()
+    };
+    name(a) == name(b) && kind(a) == kind(b)
+}
+
+fn unique_font_name(fonts: &BTreeMap<Vec<u8>, ObjectId>, name: &[u8]) -> Vec<u8> {
+    for suffix in 2.. {
+        let candidate = [name, format!("_{suffix}").as_bytes()].concat();
+        if !fonts.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Two forms in one document cannot both have a root field called "name": the
+/// full name of a field is the path of partial names, and a duplicate makes
+/// every reference to it ambiguous. The later one gets a suffix.
+fn make_root_names_unique(out: &mut Document, roots: &[ObjectId]) {
+    let mut taken: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for id in roots {
+        let Ok(dict) = out.get_dictionary(*id) else {
+            continue;
+        };
+        let Ok(title) = dict.get(b"T").and_then(|title| title.as_str()) else {
+            continue;
+        };
+        let title = title.to_vec();
+        let unique = unique_root_name(&taken, &title);
+        if unique != title
+            && let Ok(dict) = out.get_dictionary_mut(*id)
+        {
+            dict.set("T", Object::string_literal(unique.clone()));
+        }
+        taken.insert(unique);
+    }
+}
+
+fn unique_root_name(taken: &BTreeSet<Vec<u8>>, name: &[u8]) -> Vec<u8> {
+    if !taken.contains(name) {
+        return name.to_vec();
+    }
+    for suffix in 2.. {
+        let candidate = [name, format!("_{suffix}").as_bytes()].concat();
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Drop the action dictionaries from a field and everything under it.
+///
+/// Those are where the JavaScript lives. A merge cannot keep them honest: a
+/// calculation or a validation script names fields by their full name, and the
+/// name it knows may have been made unique on the way in.
+fn strip_actions(out: &mut Document, id: ObjectId, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let kids: Vec<ObjectId> = match out.get_dictionary(id) {
+        Ok(dict) => dict
+            .get(b"Kids")
+            .ok()
+            .and_then(|kids| kids.as_array().ok())
+            .map(|kids| {
+                kids.iter()
+                    .filter_map(|kid| kid.as_reference().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    if let Ok(dict) = out.get_dictionary_mut(id) {
+        dict.remove(b"AA");
+        dict.remove(b"A");
+    }
+    for kid in kids {
+        strip_actions(out, kid, depth + 1);
+    }
+}
+
+/// Point a field's `/DA` at the font's new name.
+fn rename_field_font(out: &mut Document, id: ObjectId, old: &[u8], new: &[u8], depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let (rewritten, kids): (Option<Vec<u8>>, Vec<ObjectId>) = match out.get_dictionary(id) {
+        Ok(dict) => {
+            let rewritten = dict
+                .get(b"DA")
+                .and_then(|da| da.as_str())
+                .ok()
+                .map(|da| rename_in_da(da, old, new));
+            let kids = dict
+                .get(b"Kids")
+                .ok()
+                .and_then(|kids| kids.as_array().ok())
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|kid| kid.as_reference().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (rewritten, kids)
+        }
+        Err(_) => return,
+    };
+    if let Some(da) = rewritten
+        && let Ok(dict) = out.get_dictionary_mut(id)
+    {
+        dict.set("DA", Object::String(da, lopdf::StringFormat::Literal));
+    }
+    for kid in kids {
+        rename_field_font(out, kid, old, new, depth + 1);
+    }
+}
+
+/// Replace the font name in an appearance string like `/Helv 12 Tf 0 g`.
+fn rename_in_da(da: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(da);
+    let mut tokens: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    let old = format!("/{}", String::from_utf8_lossy(old));
+    let new = format!("/{}", String::from_utf8_lossy(new));
+    let mut changed = false;
+    for index in 0..tokens.len() {
+        if tokens[index] == old
+            && tokens
+                .get(index + 1)
+                .and_then(|size| size.parse::<f64>().ok())
+                .is_some()
+            && tokens.get(index + 2).map(String::as_str) == Some("Tf")
+        {
+            tokens[index] = new.clone();
+            changed = true;
+        }
+    }
+    if changed {
+        tokens.join(" ").into_bytes()
+    } else {
+        da.to_vec()
+    }
+}
+
+/// One node of a field tree on its way into an extracted document.
+struct FieldNode {
+    id: ObjectId,
+    dict: Dictionary,
+    widget: bool,
+    children: Vec<FieldNode>,
+}
+
+fn field_root(source: &Document, widget: ObjectId) -> Option<ObjectId> {
+    let mut id = widget;
+    let mut seen = BTreeSet::new();
+    loop {
+        if !seen.insert(id) {
+            return None;
+        }
+        let parent = source
+            .get_dictionary(id)
+            .ok()
+            .and_then(|dict| dict.get(b"Parent").ok())
+            .and_then(|parent| parent.as_reference().ok());
+        match parent {
+            Some(parent) => id = parent,
+            None => return Some(id),
+        }
+    }
+}
+
+fn is_widget(dict: &Dictionary) -> bool {
+    dict.get(b"Subtype")
+        .ok()
+        .and_then(|subtype| subtype.as_name().ok())
+        == Some(b"Widget")
+}
+
+/// Keep the part of a field tree that leads to a widget which is in the output.
+fn prune_field(
+    source: &Document,
+    id: ObjectId,
+    kept: &BTreeSet<ObjectId>,
+    depth: usize,
+) -> Option<FieldNode> {
+    if depth > 32 {
+        return None;
+    }
+    let dict = source.get_dictionary(id).ok()?;
+    if is_widget(dict) {
+        if !kept.contains(&id) {
+            return None;
+        }
+        return Some(FieldNode {
+            id,
+            dict: dict.clone(),
+            widget: true,
+            children: Vec::new(),
+        });
+    }
+    let mut children = Vec::new();
+    if let Ok(kids) = dict.get(b"Kids").and_then(|kids| kids.as_array()) {
+        for kid in kids {
+            let Ok(kid) = kid.as_reference() else {
+                continue;
+            };
+            if let Some(node) = prune_field(source, kid, kept, depth + 1) {
+                children.push(node);
+            }
+        }
+    }
+    // A field with no widget and no surviving child cannot be filled in.
+    if children.is_empty() && dict.get(b"FT").is_err() {
+        return None;
+    }
+    Some(FieldNode {
+        id,
+        dict: dict.clone(),
+        widget: false,
+        children,
+    })
+}
+
+/// Write a pruned field tree into `out`, reusing the widget dictionaries the
+/// page walk already copied and making new objects for the fields above them.
+fn write_field_node(
+    out: &mut Document,
+    node: &FieldNode,
+    parent: Option<ObjectId>,
+    map: &BTreeMap<(usize, ObjectId), ObjectId>,
+    source: usize,
+) -> Option<ObjectId> {
+    let id = if node.widget {
+        *map.get(&(source, node.id))?
+    } else {
+        let mut dict = node.dict.clone();
+        for key in [b"Kids".as_slice(), b"Parent", b"AA", b"A", b"P"] {
+            dict.remove(key);
+        }
+        let mut object = Object::Dictionary(dict);
+        strip_references(&mut object);
+        let id = out.add_object(Dictionary::new());
+        out.objects.insert(id, object);
+        id
+    };
+    if let Some(parent) = parent
+        && let Ok(dict) = out.get_dictionary_mut(id)
+    {
+        dict.set("Parent", parent);
+    }
+    let mut kids = Vec::new();
+    for child in &node.children {
+        if let Some(kid) = write_field_node(out, child, Some(id), map, source) {
+            kids.push(Object::Reference(kid));
+        }
+    }
+    if !kids.is_empty()
+        && let Ok(dict) = out.get_dictionary_mut(id)
+    {
+        dict.set("Kids", kids);
+    }
+    Some(id)
+}
+
+/// Drop every entry whose value refers to another object.
+fn strip_references(object: &mut Object) {
+    let Object::Dictionary(dict) = object else {
+        return;
+    };
+    let keys: Vec<Vec<u8>> = dict
+        .iter()
+        .filter(|(_, value)| has_reference(value))
+        .map(|(key, _)| key.to_vec())
+        .collect();
+    for key in keys {
+        dict.remove(&key);
+    }
+}
+
+fn has_reference(object: &Object) -> bool {
+    match object {
+        Object::Reference(_) => true,
+        Object::Array(items) => items.iter().any(has_reference),
+        Object::Dictionary(dict) => dict.iter().any(|(_, value)| has_reference(value)),
+        Object::Stream(stream) => stream.dict.iter().any(|(_, value)| has_reference(value)),
+        _ => false,
+    }
+}
+
+/// Build the interactive form for an extracted document.
+///
+/// The pages brought their widgets along, but a widget is only half of a field:
+/// the tree above it lives in the catalogue being replaced. The tree is rebuilt
+/// here, pruned to the widgets that are in the output, so a field whose page was
+/// removed is not in the form and no widget is left without its field.
+fn build_extracted_form(
+    sources: &[Document],
+    out: &mut Document,
+    map: &BTreeMap<(usize, ObjectId), ObjectId>,
+    keys: &[(usize, ObjectId)],
+) -> Option<ObjectId> {
+    // Widgets on the pages that were kept, in page order.
+    let mut kept: BTreeMap<usize, BTreeSet<ObjectId>> = BTreeMap::new();
+    let mut order: Vec<(usize, ObjectId)> = Vec::new();
+    for (source, page) in keys {
+        let Ok(dict) = sources[*source].get_dictionary(*page) else {
+            continue;
+        };
+        let Ok(annots) = dict.get(b"Annots").and_then(|annots| annots.as_array()) else {
+            continue;
+        };
+        for annot in annots {
+            let Ok(id) = annot.as_reference() else {
+                continue;
+            };
+            let Ok(annot) = sources[*source].get_dictionary(id) else {
+                continue;
+            };
+            if !is_widget(annot) {
+                continue;
+            }
+            let entry = kept.entry(*source).or_default();
+            if entry.insert(id) {
+                order.push((*source, id));
+            }
+        }
+    }
+    if order.is_empty() {
+        return None;
+    }
+
+    // One tree per root field, even when several of its widgets were kept.
+    let mut roots: Vec<(usize, ObjectId, Vec<ObjectId>)> = Vec::new();
+    for (source, widget) in order {
+        let Some(root) = field_root(&sources[source], widget) else {
+            continue;
+        };
+        match roots
+            .iter_mut()
+            .find(|(owner, id, _)| *owner == source && *id == root)
+        {
+            Some((_, _, widgets)) => widgets.push(widget),
+            None => roots.push((source, root, vec![widget])),
+        }
+    }
+    if roots.is_empty() {
+        return None;
+    }
+
+    let mut field_refs = Vec::new();
+    let mut written: Vec<(usize, ObjectId)> = Vec::new();
+    for (source, root, _) in &roots {
+        let Some(node) = prune_field(&sources[*source], *root, &kept[source], 0) else {
+            continue;
+        };
+        if let Some(id) = write_field_node(out, &node, None, map, *source) {
+            field_refs.push(Object::Reference(id));
+            written.push((*source, id));
+        }
+    }
+    if field_refs.is_empty() {
+        return None;
+    }
+    let root_ids: Vec<ObjectId> = written.iter().map(|(_, id)| *id).collect();
+    make_root_names_unique(out, &root_ids);
+
+    // One default resource dictionary per input, in the order they appear.
+    let mut contributors: Vec<usize> = Vec::new();
+    for (source, _) in &written {
+        if !contributors.contains(source) {
+            contributors.push(*source);
+        }
+    }
+    let mut groups: Vec<BTreeMap<Vec<u8>, ObjectId>> = Vec::new();
+    let mut defaults: Vec<Option<Dictionary>> = Vec::new();
+    for source in &contributors {
+        let form = acroform_dict(&sources[*source]);
+        let mut fonts = BTreeMap::new();
+        if let Some(table) = form
+            .as_ref()
+            .and_then(|form| form.get(b"DR").ok())
+            .and_then(|dr| dr.as_dict().ok())
+            .and_then(|dr| dr.get(b"Font").ok())
+            .and_then(|fonts| fonts.as_dict().ok())
+        {
+            for (name, value) in table.iter() {
+                let Ok(id) = value.as_reference() else {
+                    continue;
+                };
+                let target = match map.get(&(*source, id)) {
+                    Some(existing) => *existing,
+                    // A font only the form used is not reachable from a page,
+                    // so it was not copied: copy the dictionary itself when it
+                    // does not point anywhere else.
+                    None => {
+                        let Ok(dict) = sources[*source].get_dictionary(id) else {
+                            continue;
+                        };
+                        let mut object = Object::Dictionary(dict.clone());
+                        strip_references(&mut object);
+                        match object {
+                            Object::Dictionary(dict) => out.add_object(dict),
+                            _ => continue,
+                        }
+                    }
+                };
+                fonts.insert(name.to_vec(), target);
+            }
+        }
+        groups.push(fonts);
+        defaults.push(form);
+    }
+
+    let merged = merge_fonts(out, &groups);
+    for (index, renamed) in merged.renames.iter().enumerate() {
+        for (old, new) in renamed {
+            for (owner, id) in &written {
+                if *owner == contributors[index] {
+                    rename_field_font(out, *id, old, new, 0);
+                }
+            }
+        }
+    }
+
+    let mut fonts = Dictionary::new();
+    for (name, id) in &merged.fonts {
+        fonts.set(name.clone(), Object::Reference(*id));
+    }
+    let mut acroform = dictionary! { "Fields" => field_refs };
+    if !fonts.is_empty() {
+        let dr = out.add_object(dictionary! { "Font" => fonts });
+        acroform.set("DR", dr);
+    }
+    if let Some(form) = defaults.first().cloned().flatten() {
+        if let Ok(da) = form.get(b"DA") {
+            acroform.set("DA", da.clone());
+        }
+        if let Ok(q) = form.get(b"Q") {
+            acroform.set("Q", q.clone());
+        }
+        if form
+            .get(b"NeedAppearances")
+            .ok()
+            .and_then(|flag| flag.as_bool().ok())
+            .unwrap_or(false)
+        {
+            acroform.set("NeedAppearances", true);
+        }
+        let sig_flags = form
+            .get(b"SigFlags")
+            .ok()
+            .and_then(|flags| flags.as_i64().ok())
+            .unwrap_or(0);
+        if sig_flags != 0 {
+            acroform.set("SigFlags", sig_flags);
+        }
+    }
+    Some(out.add_object(acroform))
+}
+
+fn acroform_dict(source: &Document) -> Option<Dictionary> {
+    let form = source.catalog().ok()?.get(b"AcroForm").ok()?.clone();
+    match form {
+        Object::Reference(id) => source.get_dictionary(id).ok().cloned(),
+        Object::Dictionary(dict) => Some(dict),
+        _ => None,
+    }
 }
 
 /// The document information dictionary of `source`, when it can be copied

@@ -128,7 +128,7 @@ trusting the writer:
 | A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
 
-`tests/edge_cases.rs` adds 52 more, against page trees written as raw bytes
+`tests/edge_cases.rs` adds 59 more, against page trees written as raw bytes
 because the shapes that break page surgery are the ones a library's own writer
 never produces: attributes inherited from a `Pages` node, a `/Parent` cycle, a
 `/Count` that lies, the same page object listed twice in `/Kids`, a zero page
@@ -160,6 +160,12 @@ an independent reader:
 Four page specs (`1,3,5`, a range, the last two pages, a single page) are also
 extracted with `qpdf` as a second opinion, and the text has to match what `qpdf`
 puts in its own copy of the same pages.
+
+Forms are checked against `pypdf`: a merge of two forms has to expose every field
+(the clash renamed), each one has to accept a value that reads back, a selection
+has to keep only the fields on the pages it kept, and every widget has to still
+be attached to its page. `scripts/check_forms.py` builds the forms with
+`reportlab` and exits non-zero when any of that stops being true; CI runs it.
 
 `scripts/check_with_poppler.sh` repeats those checks on any file you point it at.
 
@@ -205,11 +211,18 @@ whose entries all land inside those 40 pages.
   kept when the page they name survives. An `/Info` that holds a reference is
   left behind rather than copied with a pointer into a document that no longer
   exists. The XMP `/Metadata` stream and JavaScript do not travel.
-- **No forms.** Widgets are copied as annotations, but `/AcroForm`, the field
-  tree that makes them fillable, is not rebuilt, so a merged form is a picture of
-  a form rather than a working one. Bookmarks and internal links do travel:
-  names are resolved into page references, and nothing is left pointing at a page
-  that is not there.
+- **Forms travel as forms, not as pictures.** `merge`, `assemble`, `select` and
+  `split` all rebuild `/AcroForm` around the widgets that are actually in the
+  output. Fields keep their type, flags, values and appearance streams; a field
+  whose page was removed is not in the form, and a widget is never left without
+  its field. Two inputs that both have a field called `name` come out as `name`
+  and `name_2`, because a duplicate makes every reference to it ambiguous. Fonts
+  in `/DR` are shared when the name means the same face and renamed (with the
+  appearance strings rewritten) when it does not.
+- **No scripts, no XFA.** Field actions (`/AA`) are dropped: a calculation or
+  validation script names fields by full name, and a merge may have changed it.
+  An XFA form is XML the viewer renders instead of the pages, so it is left
+  behind rather than half carried.
 - **Nothing is written in place.** The document is checked before it is written
   (its catalogue must own a page tree, every reference in it must land on an
   object, no stream may be missing its length), written to a temporary file

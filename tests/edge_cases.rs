@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use pdfsurgeon::lopdf::{ObjectId, dictionary};
+use pdfsurgeon::lopdf::{Object, ObjectId, dictionary};
 use pdfsurgeon::{Document, Error, PageSpec, Piece};
 
 fn scratch(name: &str) -> PathBuf {
@@ -1306,6 +1306,409 @@ fn a_directory_is_reported_as_a_directory() {
     ]);
     assert!(!status.status.success());
     assert!(!out.exists());
+}
+
+/// A two page document with a text field on page one and a radio group whose
+/// two options sit on different pages. `font` is the `BaseFont` behind the
+/// `/Helv` resource name, so two documents can share a name but not a font.
+fn form_document(path: &Path, font: &str, with_xfa: bool, with_js: bool) {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Object, Stream, dictionary};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+
+    let mut page_content = |text: &str| {
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 18.into()]),
+                Operation::new("Td", vec![72.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()))
+    };
+    let content_one = page_content("page one");
+    let content_two = page_content("page two");
+
+    let resource_font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => font,
+    });
+    let resources = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => resource_font, "Helv" => resource_font },
+    });
+
+    // Appearance streams: a text field's and two radio states.
+    let appearance = |doc: &mut Document| {
+        let mut stream = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "Helv" => resource_font } },
+            },
+            b"q 1 1 100 18 re S Q".to_vec(),
+        );
+        stream.dict.set("Length", stream.content.len() as i64);
+        doc.add_object(stream)
+    };
+    let text_appearance = appearance(&mut doc);
+    let off_appearance = appearance(&mut doc);
+    let a_appearance = appearance(&mut doc);
+    let b_appearance = appearance(&mut doc);
+
+    let page_one_id = doc.new_object_id();
+    let page_two_id = doc.new_object_id();
+
+    let mut name_field = dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Widget",
+        "FT" => "Tx",
+        "T" => Object::string_literal("name"),
+        "V" => Object::string_literal(""),
+        "DA" => Object::string_literal("/Helv 12 Tf 0 g"),
+        "Rect" => vec![72.into(), 700.into(), 250.into(), 720.into()],
+        "P" => page_one_id,
+        "F" => 4i64,
+        "AP" => dictionary! { "N" => text_appearance },
+    };
+    if with_js {
+        name_field.set(
+            "AA",
+            dictionary! {
+                "K" => dictionary! {
+                    "S" => "JavaScript",
+                    "JS" => Object::string_literal("app.alert('hello')"),
+                },
+            },
+        );
+    }
+    let name_id = doc.add_object(name_field);
+
+    let pick_id = doc.new_object_id();
+    let kid_one = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Widget",
+        "FT" => "Btn",
+        "Parent" => pick_id,
+        "Rect" => vec![72.into(), 660.into(), 90.into(), 678.into()],
+        "AS" => "Off",
+        "P" => page_one_id,
+        "AP" => dictionary! {
+            "N" => dictionary! { "Off" => off_appearance, "a" => a_appearance },
+        },
+    });
+    let kid_two = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Widget",
+        "FT" => "Btn",
+        "Parent" => pick_id,
+        "Rect" => vec![100.into(), 660.into(), 118.into(), 678.into()],
+        "AS" => "Off",
+        "P" => page_two_id,
+        "AP" => dictionary! {
+            "N" => dictionary! { "Off" => off_appearance, "b" => b_appearance },
+        },
+    });
+    doc.objects.insert(
+        pick_id,
+        Object::Dictionary(dictionary! {
+            "FT" => "Btn",
+            "Ff" => 49152i64,
+            "T" => Object::string_literal("pick"),
+            "Kids" => vec![Object::Reference(kid_one), Object::Reference(kid_two)],
+        }),
+    );
+
+    doc.objects.insert(
+        page_one_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_one,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Annots" => vec![Object::Reference(name_id), Object::Reference(kid_one)],
+        }),
+    );
+    doc.objects.insert(
+        page_two_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_two,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Annots" => vec![Object::Reference(kid_two)],
+        }),
+    );
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_one_id), Object::Reference(page_two_id)],
+            "Count" => 2i64,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        }),
+    );
+
+    let dr = doc.add_object(dictionary! {
+        "Font" => dictionary! { "Helv" => resource_font },
+    });
+    let mut acroform = dictionary! {
+        "Fields" => vec![Object::Reference(name_id), Object::Reference(pick_id)],
+        "DA" => Object::string_literal("/Helv 0 Tf 0 g"),
+        "DR" => dr,
+    };
+    if with_xfa {
+        acroform.set("XFA", Object::string_literal("<xdp:xdp/>"));
+    }
+    let acroform_id = doc.add_object(acroform);
+    let catalog = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "AcroForm" => acroform_id,
+    });
+    doc.trailer.set("Root", catalog);
+    doc.save(path).unwrap();
+}
+
+fn field_names(doc: &Document) -> Vec<String> {
+    let Some(form) = doc.catalog().ok().and_then(|c| c.get(b"AcroForm").ok()) else {
+        return Vec::new();
+    };
+    let form = match form {
+        Object::Reference(id) => doc.get_dictionary(*id).unwrap(),
+        Object::Dictionary(dict) => dict,
+        _ => return Vec::new(),
+    };
+    form.get(b"Fields")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|field| field.as_reference().ok())
+        .filter_map(|id| doc.get_dictionary(id).ok())
+        .filter_map(|field| field.get(b"T").ok().and_then(|t| t.as_str().ok()))
+        .map(|title| String::from_utf8_lossy(title).into_owned())
+        .collect()
+}
+
+#[test]
+fn merge_keeps_the_form_and_makes_the_field_names_unique() {
+    let dir = scratch("form-merge");
+    let a = dir.join("a.pdf");
+    let b = dir.join("b.pdf");
+    form_document(&a, "Helvetica", false, false);
+    form_document(&b, "Helvetica", false, false);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&a).unwrap(),
+        Document::load(&b).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+    assert_eq!(
+        field_names(&merged),
+        vec!["name", "pick", "name_2", "pick_2"]
+    );
+}
+
+#[test]
+fn a_field_with_javascript_loses_its_actions() {
+    let dir = scratch("form-js");
+    let a = dir.join("a.pdf");
+    form_document(&a, "Helvetica", false, true);
+
+    let merged = pdfsurgeon::merge(vec![Document::load(&a).unwrap()]).unwrap();
+    let form = merged.catalog().unwrap().get(b"AcroForm").unwrap();
+    let form = match form {
+        Object::Reference(id) => merged.get_dictionary(*id).unwrap(),
+        Object::Dictionary(dict) => dict,
+        _ => panic!("no form"),
+    };
+    for field in form.get(b"Fields").unwrap().as_array().unwrap() {
+        let id = field.as_reference().unwrap();
+        assert!(
+            merged.get_dictionary(id).unwrap().get(b"AA").is_err(),
+            "the script should be gone"
+        );
+    }
+}
+
+#[test]
+fn an_xfa_form_is_left_behind_rather_than_half_carried() {
+    let dir = scratch("form-xfa");
+    let xfa = dir.join("xfa.pdf");
+    let plain = dir.join("plain-form.pdf");
+    form_document(&xfa, "Helvetica", true, false);
+    form_document(&plain, "Helvetica", false, false);
+
+    let both_xfa = pdfsurgeon::merge(vec![
+        Document::load(&xfa).unwrap(),
+        Document::load(&xfa).unwrap(),
+    ])
+    .unwrap();
+    assert!(
+        both_xfa.catalog().unwrap().get(b"AcroForm").is_err(),
+        "an XML form cannot be merged page by page"
+    );
+
+    let mixed = pdfsurgeon::merge(vec![
+        Document::load(&xfa).unwrap(),
+        Document::load(&plain).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(field_names(&mixed), vec!["name", "pick"]);
+}
+
+#[test]
+fn a_font_name_shared_by_two_different_fonts_is_renamed() {
+    let dir = scratch("form-fonts");
+    let a = dir.join("a.pdf");
+    let b = dir.join("b.pdf");
+    form_document(&a, "Helvetica", false, false);
+    form_document(&b, "Times-Roman", false, false);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&a).unwrap(),
+        Document::load(&b).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+
+    let form = merged.catalog().unwrap().get(b"AcroForm").unwrap();
+    let form = match form {
+        Object::Reference(id) => merged.get_dictionary(*id).unwrap(),
+        Object::Dictionary(dict) => dict,
+        _ => panic!("no form"),
+    };
+    let dr = form.get(b"DR").unwrap().as_reference().unwrap();
+    let fonts = merged
+        .get_dictionary(dr)
+        .unwrap()
+        .get(b"Font")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    let mut names: Vec<String> = fonts
+        .iter()
+        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Helv", "Helv_2"]);
+
+    // The second document's field has to name the font it actually uses.
+    let fields = form.get(b"Fields").unwrap().as_array().unwrap();
+    let second = fields[2].as_reference().unwrap();
+    let da = merged
+        .get_dictionary(second)
+        .unwrap()
+        .get(b"DA")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_vec();
+    assert!(
+        da.starts_with(b"/Helv_2 "),
+        "expected the renamed font, got {:?}",
+        String::from_utf8_lossy(&da)
+    );
+}
+
+#[test]
+fn assemble_from_two_forms_gives_every_field_a_unique_name() {
+    let dir = scratch("form-assemble");
+    let a = dir.join("a.pdf");
+    let b = dir.join("b.pdf");
+    form_document(&a, "Helvetica", false, false);
+    form_document(&b, "Helvetica", false, false);
+
+    let assembled = pdfsurgeon::assemble(
+        &[Document::load(&a).unwrap(), Document::load(&b).unwrap()],
+        &[
+            Piece {
+                source: 0,
+                pages: vec![1],
+            },
+            Piece {
+                source: 1,
+                pages: vec![1],
+            },
+        ],
+    )
+    .unwrap();
+    assert_no_dangling_references(&assembled);
+    assert_eq!(
+        field_names(&assembled),
+        vec!["name", "pick", "name_2", "pick_2"]
+    );
+}
+
+#[test]
+fn split_carries_the_field_of_the_page_it_wrote() {
+    let dir = scratch("form-split");
+    let file = dir.join("form.pdf");
+    form_document(&file, "Helvetica", false, false);
+    let out = dir.join("parts");
+    let status = cli(&[
+        "split",
+        file.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(status.status.success(), "{}", stderr(&status));
+
+    let first = Document::load(out.join("form-001.pdf")).unwrap();
+    assert_eq!(field_names(&first), vec!["name", "pick"]);
+    let second = Document::load(out.join("form-002.pdf")).unwrap();
+    assert_eq!(field_names(&second), vec!["pick"]);
+}
+
+#[test]
+fn select_keeps_the_fields_on_the_pages_it_kept() {
+    let dir = scratch("form-select");
+    let file = dir.join("form.pdf");
+    form_document(&file, "Helvetica", false, false);
+
+    let doc = Document::load(&file).unwrap();
+    let first = pdfsurgeon::select(&doc, &[1]).unwrap();
+    assert_no_dangling_references(&first);
+    assert_eq!(field_names(&first), vec!["name", "pick"]);
+    // Both pages had an option in the group; only the one on page one is left.
+    let form = first.catalog().unwrap().get(b"AcroForm").unwrap();
+    let form = match form {
+        Object::Reference(id) => first.get_dictionary(*id).unwrap(),
+        Object::Dictionary(dict) => dict,
+        _ => panic!("no form"),
+    };
+    let pick = form.get(b"Fields").unwrap().as_array().unwrap()[1]
+        .as_reference()
+        .unwrap();
+    let kids = first
+        .get_dictionary(pick)
+        .unwrap()
+        .get(b"Kids")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(kids, 1);
+
+    let second = pdfsurgeon::select(&doc, &[2]).unwrap();
+    assert_no_dangling_references(&second);
+    assert_eq!(field_names(&second), vec!["pick"]);
+
+    // The page that was dropped must not survive as an orphan object.
+    let pages = second
+        .objects
+        .values()
+        .filter(|object| matches!(object.type_name(), Ok(name) if name == b"Page"))
+        .count();
+    assert_eq!(pages, 1);
 }
 
 // ---------------------------------------------------------------------------
