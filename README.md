@@ -128,7 +128,7 @@ trusting the writer:
 | A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
 
-`tests/edge_cases.rs` adds 47 more, against page trees written as raw bytes
+`tests/edge_cases.rs` adds 52 more, against page trees written as raw bytes
 because the shapes that break page surgery are the ones a library's own writer
 never produces: attributes inherited from a `Pages` node, a `/Parent` cycle, a
 `/Count` that lies, the same page object listed twice in `/Kids`, a zero page
@@ -185,6 +185,12 @@ node above it, its resources, media box, crop box and rotation, is written onto
 the page itself on the way out. A page that leaves the old tree without those
 opens blank, or at the wrong size.
 
+Bookmarks are rebuilt rather than copied: the outline of the input is walked,
+every destination is resolved to the page it names, and only the items whose page
+survived are written into a fresh tree in the new document's numbering. Selecting
+pages 1-40 of RFC 9110 gives a file whose outline still has its three levels and
+whose entries all land inside those 40 pages.
+
 ## What it deliberately does not do
 
 - **No decryption.** `info` reports an encrypted file; every command that would
@@ -214,10 +220,11 @@ opens blank, or at the wrong size.
   the size of the input apart from the removed pages.
 - **Links into removed pages are dropped.** A file whose links pointed at page 12
   will lose those links if page 12 is gone; keeping them would keep the warnings.
-- **Bookmarks survive a merge, not an extraction.** `select`, `split` and
-  `assemble` build a document from pages alone, so the outline that used to
-  describe the whole file is not carried; a bookmark pointing at a page that is
-  still there would be a guess about what the new document is called.
+- **Bookmarks are pruned, not invented.** A merge splices every input's outline
+  into one tree. `select` and `assemble` keep the bookmarks whose page came
+  along, drop the rest, and lift the children of a dropped section up a level so
+  a jump that still works is not lost with its heading. `split` writes one page
+  files without an outline: there is nowhere in a single page to travel to.
 - **Text extraction is not exposed.** `info` reads structure only.
 
 ## Why another PDF tool

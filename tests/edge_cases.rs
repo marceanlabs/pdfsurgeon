@@ -638,6 +638,204 @@ fn linked_document(path: &Path) {
     );
 }
 
+/// Three pages and a two level outline: "Part one" (page 1) holds "Section A"
+/// (page 2), and "Part two" sits alone on page 3.
+fn outlined_document(path: &Path, looping_next: bool) {
+    let (s1, s2, s3) = (stream("one"), stream("two"), stream("three"));
+    let last_tail: &[u8] = if looping_next {
+        b"/Parent 30 0 R /Next 33 0 R"
+    } else {
+        b"/Parent 30 0 R"
+    };
+    let object33 = format!(
+        "<< /Title (Part two) /Dest [15 0 R /Fit] {} >>",
+        String::from_utf8_lossy(last_tail)
+    );
+    raw_pdf(
+        path,
+        &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /Outlines 30 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Count 3 /Kids [3 0 R 4 0 R 15 0 R] /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>"),
+            (4, b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>"),
+            (15, b"<< /Type /Page /Parent 2 0 R /Contents 16 0 R >>"),
+            (5, &s1),
+            (6, &s2),
+            (16, &s3),
+            (
+                30,
+                b"<< /Type /Outlines /First 31 0 R /Last 33 0 R /Count 3 >>",
+            ),
+            (
+                31,
+                b"<< /Title (Part one) /Parent 30 0 R /Dest [3 0 R /Fit] /Next 33 0 R
+                    /First 32 0 R /Last 32 0 R /Count 1 >>",
+            ),
+            (
+                32,
+                b"<< /Title (Section A) /Parent 31 0 R /Dest [4 0 R /Fit] >>",
+            ),
+            (33, object33.as_bytes()),
+        ],
+    );
+}
+
+fn outline_titles(doc: &Document) -> Vec<String> {
+    let Ok(catalog) = doc.catalog() else {
+        return Vec::new();
+    };
+    let Ok(root) = catalog.get(b"Outlines").and_then(|r| r.as_reference()) else {
+        return Vec::new();
+    };
+    let Ok(first) = doc
+        .get_dictionary(root)
+        .and_then(|d| d.get(b"First"))
+        .and_then(|f| f.as_reference())
+    else {
+        return Vec::new();
+    };
+    let mut titles = Vec::new();
+    let mut cursor = Some(first);
+    while let Some(id) = cursor {
+        let Ok(dict) = doc.get_dictionary(id) else {
+            break;
+        };
+        titles.push(String::from_utf8_lossy(dict.get(b"Title").unwrap().as_str().unwrap()).into());
+        cursor = dict.get(b"Next").ok().and_then(|n| n.as_reference().ok());
+    }
+    titles
+}
+
+#[test]
+fn select_brings_the_bookmarks_that_point_at_the_pages_it_kept() {
+    let dir = scratch("outline-select");
+    let file = dir.join("outlined.pdf");
+    outlined_document(&file, false);
+
+    let doc = Document::load(&file).unwrap();
+    let picked = pdfsurgeon::select(&doc, &[1]).unwrap();
+    assert_no_dangling_references(&picked);
+    assert_eq!(outline_titles(&picked), vec!["Part one"]);
+
+    // The destination has to point at the page in the new document, not at the
+    // id it had in the old one.
+    let catalog = picked.catalog().unwrap();
+    let root = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+    let item = picked
+        .get_dictionary(root)
+        .unwrap()
+        .get(b"First")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let dest = picked
+        .get_dictionary(item)
+        .unwrap()
+        .get(b"Dest")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(dest[0].as_reference().unwrap(), picked.get_pages()[&1]);
+}
+
+#[test]
+fn a_bookmark_whose_page_went_away_leaves_its_children_at_the_top() {
+    let dir = scratch("outline-hoist");
+    let file = dir.join("outlined.pdf");
+    outlined_document(&file, false);
+
+    let doc = Document::load(&file).unwrap();
+    // Page 2 alone: "Part one" pointed at page 1 and goes, but "Section A"
+    // pointed at page 2 and should still be reachable.
+    let picked = pdfsurgeon::select(&doc, &[2]).unwrap();
+    assert_no_dangling_references(&picked);
+    assert_eq!(outline_titles(&picked), vec!["Section A"]);
+}
+
+#[test]
+fn a_bookmark_keeps_its_children_while_its_page_is_kept() {
+    let dir = scratch("outline-nested");
+    let file = dir.join("outlined.pdf");
+    outlined_document(&file, false);
+
+    let doc = Document::load(&file).unwrap();
+    let picked = pdfsurgeon::select(&doc, &[1, 2]).unwrap();
+    assert_no_dangling_references(&picked);
+    assert_eq!(outline_titles(&picked), vec!["Part one"]);
+
+    let catalog = picked.catalog().unwrap();
+    let root = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+    let parent = picked
+        .get_dictionary(root)
+        .unwrap()
+        .get(b"First")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let dict = picked.get_dictionary(parent).unwrap();
+    assert_eq!(dict.get(b"Count").unwrap().as_i64().unwrap(), 1);
+    let child = dict.get(b"First").unwrap().as_reference().unwrap();
+    assert_eq!(
+        picked
+            .get_dictionary(child)
+            .unwrap()
+            .get(b"Title")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        b"Section A"
+    );
+    assert_eq!(
+        picked
+            .get_dictionary(child)
+            .unwrap()
+            .get(b"Parent")
+            .unwrap()
+            .as_reference()
+            .unwrap(),
+        parent
+    );
+}
+
+#[test]
+fn split_leaves_bookmarks_out() {
+    // A one page file has nothing to navigate to, and building an outline per
+    // page costs a quarter of what split spends.
+    let dir = scratch("outline-split");
+    let file = dir.join("outlined.pdf");
+    outlined_document(&file, false);
+    let out = dir.join("parts");
+    let status = cli(&[
+        "split",
+        file.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(status.status.success(), "{}", stderr(&status));
+
+    let part = Document::load(out.join("outlined-001.pdf")).unwrap();
+    assert!(part.catalog().unwrap().get(b"Outlines").is_err());
+}
+
+#[test]
+fn a_looping_outline_chain_does_not_hang() {
+    let dir = scratch("outline-loop");
+    let file = dir.join("looping.pdf");
+    outlined_document(&file, true);
+
+    let doc = Document::load(&file).unwrap();
+    let picked = pdfsurgeon::select(&doc, &[1, 2, 3]).unwrap();
+    assert_no_dangling_references(&picked);
+    assert_eq!(
+        outline_titles(&picked),
+        vec!["Part one", "Part two"],
+        "each bookmark should appear once even when the chain loops"
+    );
+}
+
 #[test]
 fn select_output_has_no_references_to_missing_objects() {
     let dir = scratch("refs-select");

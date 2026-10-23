@@ -458,7 +458,10 @@ pub fn split(doc: &Document) -> Result<Vec<Document>> {
     let source = std::slice::from_ref(doc);
     let mut pages = Vec::with_capacity(by_number.len());
     for id in by_number.values() {
-        pages.push(extract_with_names(source, &[(0, *id)], names));
+        // No bookmarks in a one page file: the only ones left would point at
+        // the page they are listed in, and walking the outline tree once per
+        // page is a quarter of the time split spends.
+        pages.push(extract_with_names(source, &[(0, *id)], names, false));
     }
     Ok(pages)
 }
@@ -849,7 +852,7 @@ pub fn rotate(doc: &mut Document, pages: &[u32], angle: i64) -> Result<()> {
 /// can exist in the result.
 fn extract_from(sources: &[Document], keys: &[(usize, ObjectId)]) -> Document {
     let names: Vec<BTreeMap<Vec<u8>, Object>> = sources.iter().map(named_destinations).collect();
-    extract_with_names(sources, keys, &names)
+    extract_with_names(sources, keys, &names, true)
 }
 
 /// The body of [`extract_from`], with the named destinations already read so a
@@ -858,6 +861,7 @@ fn extract_with_names(
     sources: &[Document],
     keys: &[(usize, ObjectId)],
     names: &[BTreeMap<Vec<u8>, Object>],
+    bookmarks: bool,
 ) -> Document {
     let version = sources
         .first()
@@ -930,12 +934,242 @@ fn extract_with_names(
         let info = out.add_object(info);
         out.trailer.set("Info", info);
     }
-    let catalog_id = out.add_object(dictionary! {
+    let outlines = if bookmarks {
+        build_outlines(&mut out, &sources[0], &names[0], &map)
+    } else {
+        None
+    };
+    let mut catalog = dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
-    });
+    };
+    if let Some(outlines_id) = outlines {
+        catalog.set("Outlines", outlines_id);
+        if sources[0]
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"PageMode").ok())
+            .and_then(|mode| mode.as_name().ok())
+            == Some(b"UseOutlines")
+        {
+            catalog.set("PageMode", "UseOutlines");
+        }
+    }
+    let catalog_id = out.add_object(catalog);
     out.trailer.set("Root", catalog_id);
     out
+}
+
+/// One bookmark on its way from the source document to the new one.
+struct OutlineItem {
+    title: Object,
+    /// Destination array in output ids, first element the page.
+    dest: Option<Vec<Object>>,
+    colour: Option<Object>,
+    flags: Option<Object>,
+    open: bool,
+    children: Vec<OutlineItem>,
+}
+
+/// Carry the bookmarks of `source` into `out`, keeping only those that point at
+/// a page the new document contains.
+///
+/// A bookmark whose page did not come along is dropped, and if it had children
+/// that did, they take its place rather than disappearing with it: a jump that
+/// works is worth more than the indentation around it.
+fn build_outlines(
+    out: &mut Document,
+    source: &Document,
+    names: &BTreeMap<Vec<u8>, Object>,
+    map: &BTreeMap<(usize, ObjectId), ObjectId>,
+) -> Option<ObjectId> {
+    let root = source
+        .catalog()
+        .ok()?
+        .get(b"Outlines")
+        .ok()?
+        .as_reference()
+        .ok()?;
+    let first = source
+        .get_dictionary(root)
+        .ok()?
+        .get(b"First")
+        .ok()?
+        .as_reference()
+        .ok()?;
+    let mut seen = BTreeSet::new();
+    let items = outline_items(source, first, names, map, 0, &mut seen);
+    if items.is_empty() {
+        return None;
+    }
+    let root_id = out.add_object(dictionary! { "Type" => "Outlines" });
+    let (span, visible) = write_outline_level(out, &items, root_id);
+    let dict = out.get_dictionary_mut(root_id).ok()?;
+    if let Some((first, last)) = span {
+        dict.set("First", first);
+        dict.set("Last", last);
+    }
+    dict.set("Count", visible);
+    Some(root_id)
+}
+
+fn outline_items(
+    source: &Document,
+    first: ObjectId,
+    names: &BTreeMap<Vec<u8>, Object>,
+    map: &BTreeMap<(usize, ObjectId), ObjectId>,
+    depth: usize,
+    seen: &mut BTreeSet<ObjectId>,
+) -> Vec<OutlineItem> {
+    if depth > 32 {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    let mut cursor = Some(first);
+    while let Some(id) = cursor {
+        // A `/Next` chain that loops back on itself would run forever.
+        if !seen.insert(id) {
+            break;
+        }
+        let Ok(dict) = source.get_dictionary(id) else {
+            break;
+        };
+        cursor = dict
+            .get(b"Next")
+            .ok()
+            .and_then(|next| next.as_reference().ok());
+        let Some(title) = dict.get(b"Title").ok().cloned() else {
+            continue;
+        };
+        let dest = dict
+            .get(b"Dest")
+            .ok()
+            .or_else(|| dict.get(b"A").ok())
+            .and_then(|target| outline_destination(target, source, names, map));
+        let children = match dict.get(b"First").and_then(|f| f.as_reference()) {
+            Ok(child) => outline_items(source, child, names, map, depth + 1, seen),
+            Err(_) => Vec::new(),
+        };
+        if dest.is_none() {
+            if children.is_empty() {
+                continue;
+            }
+            // A section whose own page is gone still holds jumps worth keeping.
+            items.extend(children);
+            continue;
+        }
+        items.push(OutlineItem {
+            title,
+            dest,
+            colour: dict.get(b"C").ok().cloned(),
+            flags: dict.get(b"F").ok().cloned(),
+            open: dict
+                .get(b"Count")
+                .ok()
+                .and_then(|count| count.as_i64().ok())
+                .map(|count| count >= 0)
+                .unwrap_or(true),
+            children,
+        });
+    }
+    items
+}
+
+/// The destination of a bookmark as an array whose first entry points at a page
+/// of the new document, or `None` when that page is not part of it.
+fn outline_destination(
+    target: &Object,
+    source: &Document,
+    names: &BTreeMap<Vec<u8>, Object>,
+    map: &BTreeMap<(usize, ObjectId), ObjectId>,
+) -> Option<Vec<Object>> {
+    let resolved = resolve_destination(target, names, 0)?;
+    let items = resolved.as_array().ok()?;
+    let (page, rest) = items.split_first()?;
+    let source_page = match page {
+        Object::Reference(id) => *id,
+        // Older producers write the page number rather than a reference.
+        Object::Integer(number) => {
+            let number = u32::try_from(*number).ok()?;
+            *source.get_pages().get(&number)?
+        }
+        _ => return None,
+    };
+    let new_page = *map.get(&(0, source_page))?;
+    let mut dest = Vec::with_capacity(items.len());
+    dest.push(Object::Reference(new_page));
+    dest.extend(rest.iter().cloned());
+    Some(dest)
+}
+
+/// Write one level of the outline: the items are already reserved, so the chain
+/// and each item's children can be filled in without holding a borrow across
+/// the recursion. Returns the first and last id of the level, and how many
+/// entries a reader shows when it is open.
+fn write_outline_level(
+    out: &mut Document,
+    items: &[OutlineItem],
+    parent: ObjectId,
+) -> (Option<(ObjectId, ObjectId)>, i64) {
+    let ids: Vec<ObjectId> = items
+        .iter()
+        .map(|_| out.add_object(Dictionary::new()))
+        .collect();
+    let mut spans: Vec<(Option<(ObjectId, ObjectId)>, i64)> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        spans.push(write_outline_level(out, &item.children, ids[index]));
+    }
+    let mut visible = 0i64;
+    for (index, item) in items.iter().enumerate() {
+        let (span, children_visible) = spans[index];
+        let id = ids[index];
+        let Ok(dict) = out.get_dictionary_mut(id) else {
+            continue;
+        };
+        dict.set("Title", item.title.clone());
+        dict.set("Parent", parent);
+        if index > 0 {
+            dict.set("Prev", ids[index - 1]);
+        }
+        if let Some(next) = ids.get(index + 1) {
+            dict.set("Next", *next);
+        }
+        if let Some((first, last)) = span {
+            dict.set("First", first);
+            dict.set("Last", last);
+        }
+        if children_visible > 0 {
+            dict.set(
+                "Count",
+                if item.open {
+                    children_visible
+                } else {
+                    -children_visible
+                },
+            );
+            visible += 1 + if item.open { children_visible } else { 0 };
+        } else {
+            visible += 1;
+        }
+        if let Some(dest) = &item.dest {
+            dict.set("Dest", Object::Array(dest.clone()));
+        }
+        if let Some(colour) = &item.colour
+            && colour.as_array().is_ok()
+        {
+            dict.set("C", colour.clone());
+        }
+        if let Some(flags) = &item.flags
+            && flags.as_i64().is_ok()
+        {
+            dict.set("F", flags.clone());
+        }
+    }
+    let span = ids
+        .first()
+        .zip(ids.last())
+        .map(|(first, last)| (*first, *last));
+    (span, visible)
 }
 
 /// The document information dictionary of `source`, when it can be copied
