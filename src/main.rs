@@ -173,6 +173,9 @@ fn spec_text(value: OsString) -> Res<String> {
 /// Load with the path in the message: "IO error" on its own does not say which
 /// file was missing.
 fn load(path: &Path) -> Res<Document> {
+    if path.is_dir() {
+        return Err(format!("{}: is a directory", path.display()).into());
+    }
     Document::load(path).map_err(|err| format!("{}: {err}", path.display()).into())
 }
 

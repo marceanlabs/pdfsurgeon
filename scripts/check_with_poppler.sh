@@ -12,8 +12,16 @@ binary=${BINARY:-./target/release/pdfsurgeon}
 [ -x "$binary" ] || { echo "build it first: cargo build --release"; exit 1; }
 command -v pdfinfo >/dev/null || { echo "needs poppler: apt install poppler-utils"; exit 1; }
 
-work=$(mktemp -d)
-trap 'mv "$work" "${TMPDIR:-/tmp}/pdfsurgeon-check-$(date +%s)"' EXIT
+# Under `target/`, not the ambient TMPDIR: qpdf 12 on this machine refuses to
+# create files under some sandboxed temp paths ("Permission denied") and the
+# oracle needs to write the reference document beside our output.
+mkdir -p target
+work=$(mktemp -d target/oracle.XXXXXX)
+status=0
+cleanup() {
+  if [ "$status" -eq 0 ]; then rm -rf "$work"; else echo "kept for inspection: $work"; fi
+}
+trap cleanup EXIT
 
 first_total=$("$binary" info "$1" | awk '/^pages:/ {print $2}')
 
@@ -61,6 +69,24 @@ for input in "$@"; do
   fi
 
   echo "  parts: $(find "$work/$name-parts" -name '*.pdf' | wc -l) files, warnings checked"
+
+  # A page spec the command has to expand, with a reference built by qpdf
+  # rather than by us: the text of the selection must match the text of the
+  # same pages in the reference document.
+  if command -v qpdf >/dev/null && command -v pdftotext >/dev/null && [ "$total" -ge 5 ]; then
+    for spec in "1,3,5" "2-4" "$(( total - 1 ))-$total" "4"; do
+      "$binary" select "$input" --pages "$spec" -o "$work/$name-spec.pdf"
+      qpdf "$input" --pages . "$spec" -- "$work/$name-ref.pdf"
+      pdftotext "$work/$name-spec.pdf" "$work/spec.txt"
+      pdftotext "$work/$name-ref.pdf" "$work/ref.txt"
+      if diff -q "$work/spec.txt" "$work/ref.txt" >/dev/null; then
+        echo "  select $spec: text matches qpdf's copy"
+      else
+        echo "  FAIL  select $spec: text differs from qpdf's copy"
+        status=1
+      fi
+    done
+  fi
 done
 
 # With two or more inputs, also assemble and merge mixed documents and check

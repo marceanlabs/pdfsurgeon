@@ -128,7 +128,7 @@ trusting the writer:
 | A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
 
-`tests/edge_cases.rs` adds 43 more, against page trees written as raw bytes
+`tests/edge_cases.rs` adds 47 more, against page trees written as raw bytes
 because the shapes that break page surgery are the ones a library's own writer
 never produces: attributes inherited from a `Pages` node, a `/Parent` cycle, a
 `/Count` that lies, the same page object listed twice in `/Kids`, a zero page
@@ -143,7 +143,8 @@ The command line is tested the same way: flags before or after the file, a file
 named `-like-a-flag` after `--`, a path with a colon in it, a path that is not
 valid UTF-8, output written over the input, a write into a directory that does
 not exist (nothing is written, the input is untouched, no `.part` file is left),
-and four kinds of file that are not documents at all. Finally, 48 byte-mutated
+four kinds of file that are not documents at all, and a directory (which is
+named as one instead of surfacing as "IO error"). Finally, 48 byte-mutated
 copies of a real document must either work or exit 1: the process is never
 allowed to crash.
 
@@ -155,6 +156,10 @@ an independent reader:
 - text extracted from a selection is byte identical to the same page range
   extracted from the original
 - merging the 194 page RFC with the 15 page paper gives a clean 209 page file
+
+Four page specs (`1,3,5`, a range, the last two pages, a single page) are also
+extracted with `qpdf` as a second opinion, and the text has to match what `qpdf`
+puts in its own copy of the same pages.
 
 `scripts/check_with_poppler.sh` repeats those checks on any file you point it at.
 
@@ -171,7 +176,9 @@ took over six minutes.
 them, so links between the merged files' own pages keep working. The bookmarks
 of every input are spliced into one outline, and a link that went through a
 named destination is rewritten to point at the page the name resolved to, so a
-merged LaTeX paper keeps both its contents list and its cross references.
+merged LaTeX paper keeps both its contents list and its cross references. The
+first input's `/Info` dictionary, its starting view and its request to show the
+outline panel come across with it.
 
 Both rebuilds flatten the tree, so anything a page was inheriting from a `Pages`
 node above it, its resources, media box, crop box and rotation, is written onto
@@ -186,10 +193,17 @@ opens blank, or at the wrong size.
   damaged files that parse only by guesswork: a stream whose `/Length` is
   missing or does not match the bytes that were read would be copied without
   its content, so the whole command stops instead.
-- **No forms, metadata or document level scripts.** `merge` builds one
-  catalogue, so `/AcroForm`, `/Metadata` and JavaScript from the inputs do not
-  travel. Bookmarks and internal links do: names are resolved into page
-  references, and nothing is left pointing at a page that is not there.
+- **Metadata travels only when it is self-contained.** The first input's
+  `/Info` dictionary (title, author, subject, keywords, dates) is carried through
+  a merge and through an extraction, and its `/OpenAction` and `/PageMode` are
+  kept when the page they name survives. An `/Info` that holds a reference is
+  left behind rather than copied with a pointer into a document that no longer
+  exists. The XMP `/Metadata` stream and JavaScript do not travel.
+- **No forms.** Widgets are copied as annotations, but `/AcroForm`, the field
+  tree that makes them fillable, is not rebuilt, so a merged form is a picture of
+  a form rather than a working one. Bookmarks and internal links do travel:
+  names are resolved into page references, and nothing is left pointing at a page
+  that is not there.
 - **Nothing is written in place.** The document is checked before it is written
   (its catalogue must own a page tree, every reference in it must land on an
   object, no stream may be missing its length), written to a temporary file

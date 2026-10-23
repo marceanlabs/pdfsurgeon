@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use pdfsurgeon::lopdf::ObjectId;
+use pdfsurgeon::lopdf::{ObjectId, dictionary};
 use pdfsurgeon::{Document, Error, PageSpec, Piece};
 
 fn scratch(name: &str) -> PathBuf {
@@ -990,6 +990,124 @@ fn merge_drops_the_source_cross_reference_stream() {
     );
     assert_no_dangling_references(&merged);
     assert_eq!(merged.get_pages().len(), 2);
+}
+
+#[test]
+fn merge_carries_the_metadata_and_open_action_of_the_first_input() {
+    let dir = scratch("catalog-extras");
+    let a = dir.join("a.pdf");
+    let b = dir.join("b.pdf");
+    linked_document(&a);
+    linked_document(&b);
+
+    // Give each input its own title and a starting view, the way a producer
+    // would: /Info in the trailer, /OpenAction in the catalogue.
+    for (path, title) in [(&a, "First document"), (&b, "Second document")] {
+        let mut doc = Document::load(path).unwrap();
+        let info = doc.add_object(lopdf::dictionary! {
+            "Title" => lopdf::Object::string_literal(title)
+        });
+        doc.trailer.set("Info", info);
+        let page_one = doc.get_pages()[&1];
+        doc.catalog_mut().unwrap().set(
+            "OpenAction",
+            vec![lopdf::Object::Reference(page_one), "Fit".into()],
+        );
+        doc.catalog_mut().unwrap().set("PageMode", "UseOutlines");
+        doc.save(path).unwrap();
+    }
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&a).unwrap(),
+        Document::load(&b).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+
+    let info = merged.trailer.get(b"Info").unwrap().as_reference().unwrap();
+    let title = merged.get_dictionary(info).unwrap().get(b"Title").unwrap();
+    assert_eq!(title.as_str().unwrap(), b"First document");
+
+    let catalog = merged.catalog().unwrap();
+    assert_eq!(
+        catalog.get(b"PageMode").unwrap().as_name().unwrap(),
+        b"UseOutlines",
+        "a merged file with bookmarks should ask for the outline panel"
+    );
+    let action = catalog.get(b"OpenAction").unwrap().as_array().unwrap();
+    assert_eq!(
+        action[0].as_reference().unwrap(),
+        merged.get_pages()[&1],
+        "the starting view should still be the first page"
+    );
+}
+
+#[test]
+fn extraction_keeps_a_self_contained_info_dictionary() {
+    let dir = scratch("info-through-select");
+    let file = dir.join("titled.pdf");
+    linked_document(&file);
+    let mut doc = Document::load(&file).unwrap();
+    let info = doc.add_object(lopdf::dictionary! {
+        "Title" => lopdf::Object::string_literal("Quarterly report"),
+        "Author" => lopdf::Object::string_literal("A. Walker"),
+    });
+    doc.trailer.set("Info", info);
+    doc.save(&file).unwrap();
+
+    let picked = pdfsurgeon::select(&Document::load(&file).unwrap(), &[1]).unwrap();
+    assert_no_dangling_references(&picked);
+    let info = picked.trailer.get(b"Info").unwrap().as_reference().unwrap();
+    let title = picked.get_dictionary(info).unwrap().get(b"Title").unwrap();
+    assert_eq!(title.as_str().unwrap(), b"Quarterly report");
+}
+
+#[test]
+fn an_info_dictionary_holding_a_reference_is_left_behind() {
+    // Copying it would mean copying a pointer to an object the extraction has
+    // no reason to keep, and the output would hold a dead reference.
+    let dir = scratch("info-with-reference");
+    let file = dir.join("referring.pdf");
+    linked_document(&file);
+    let mut doc = Document::load(&file).unwrap();
+    let page = doc.get_pages()[&1];
+    let info = doc.add_object(lopdf::dictionary! {
+        "Title" => lopdf::Object::string_literal("Report"),
+        "Trapped" => lopdf::Object::Reference(page),
+    });
+    doc.trailer.set("Info", info);
+    doc.save(&file).unwrap();
+
+    let picked = pdfsurgeon::select(&Document::load(&file).unwrap(), &[1]).unwrap();
+    assert_no_dangling_references(&picked);
+    assert!(
+        picked.trailer.get(b"Info").is_err(),
+        "the metadata should be dropped rather than copied with a dead pointer"
+    );
+}
+
+#[test]
+fn a_directory_is_reported_as_a_directory() {
+    let dir = scratch("dir-input");
+    let out = dir.join("out.pdf");
+    let status = cli(&["info", dir.to_str().unwrap()]);
+    assert!(!status.status.success());
+    assert!(
+        stderr(&status).contains("is a directory"),
+        "{}",
+        stderr(&status)
+    );
+
+    let status = cli(&[
+        "select",
+        dir.to_str().unwrap(),
+        "--pages",
+        "1",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(!status.status.success());
+    assert!(!out.exists());
 }
 
 // ---------------------------------------------------------------------------

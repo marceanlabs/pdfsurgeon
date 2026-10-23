@@ -28,7 +28,7 @@ use std::fmt;
 
 pub use lopdf;
 pub use lopdf::Document;
-use lopdf::{Object, ObjectId, dictionary};
+use lopdf::{Dictionary, Object, ObjectId, dictionary};
 
 /// Everything this crate can go wrong with.
 #[derive(Debug)]
@@ -558,6 +558,26 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     for source in &sources {
         check_streams(source)?;
     }
+    // The document level bits worth carrying from the first input: its
+    // metadata, and the view it asked a reader to open in.
+    let first_info = sources[0].trailer.get(b"Info").ok().cloned();
+    let first_catalog = sources[0].catalog().ok().cloned();
+    let first_open_action = first_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.get(b"OpenAction").ok().cloned())
+        .filter(|action| match action {
+            // Only a plain page destination, whose page keeps its id because
+            // the first input is copied without an offset.
+            Object::Array(items) => matches!(items.first(), Some(Object::Reference(_))),
+            Object::Reference(id) => sources[0].get_dictionary(*id).is_ok(),
+            _ => false,
+        });
+    let first_page_mode = first_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.get(b"PageMode").ok())
+        .and_then(|mode| mode.as_name().ok())
+        .map(<[u8]>::to_vec);
+
     let mut out = Document::with_version(sources[0].version.clone());
     let mut offset: u32 = 0;
     let mut page_ids: Vec<ObjectId> = Vec::new();
@@ -663,10 +683,21 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
         "Pages" => pages_id,
     };
     if let Some(outlines_id) = rebuild_outlines(&mut out, &outlines) {
+        // A merged document that has bookmarks should offer them: the reader
+        // only shows the panel when the catalogue asks it to.
+        if first_page_mode.as_deref() == Some(b"UseOutlines") {
+            catalog.set("PageMode", "UseOutlines");
+        }
         catalog.set("Outlines", outlines_id);
+    }
+    if let Some(action) = first_open_action {
+        catalog.set("OpenAction", action);
     }
     let catalog_id = out.add_object(catalog);
     out.trailer.set("Root", catalog_id);
+    if let Some(info) = first_info {
+        out.trailer.set("Info", info);
+    }
     Ok(out)
 }
 
@@ -895,12 +926,39 @@ fn extract_with_names(
     }
 
     out.max_id = next - 1;
+    if let Some(info) = self_contained_info(&sources[0]) {
+        let info = out.add_object(info);
+        out.trailer.set("Info", info);
+    }
     let catalog_id = out.add_object(dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
     });
     out.trailer.set("Root", catalog_id);
     out
+}
+
+/// The document information dictionary of `source`, when it can be copied
+/// without dragging anything behind it. A value that is a reference would point
+/// at an object the extraction has no reason to keep, so a dictionary holding
+/// one is left behind rather than copied with a broken pointer in it.
+fn self_contained_info(source: &Document) -> Option<Dictionary> {
+    let info = source.trailer.get(b"Info").ok()?;
+    let dict = match info {
+        Object::Reference(id) => source.get_dictionary(*id).ok()?,
+        Object::Dictionary(dict) => dict,
+        _ => return None,
+    };
+    let mut stack: Vec<&Object> = dict.iter().map(|(_, value)| value).collect();
+    while let Some(object) = stack.pop() {
+        match object {
+            Object::Reference(_) => return None,
+            Object::Array(items) => stack.extend(items.iter()),
+            Object::Dictionary(inner) => stack.extend(inner.iter().map(|(_, value)| value)),
+            _ => {}
+        }
+    }
+    Some(dict.clone())
 }
 
 /// Rewrite every reference in `object` to point into the new document,
