@@ -60,8 +60,8 @@ pdfsurgeon select <file> --pages <spec> -o <out.pdf>
 pdfsurgeon rotate <file> --pages <spec> --angle <deg> -o <out.pdf>
 ```
 
-`--password <pw>` opens an encrypted input, `--compress` squeezes streams that
-carry no filter, and both work on every command that reads a file.
+`--password <pw>` opens an encrypted input and works on every command that reads
+a file.
 
 Split names its files `<name>-<page>.pdf` with at least three digits, and more
 when the page count needs them, so they sort beside the original.
@@ -255,10 +255,10 @@ whose entries all land inside those 40 pages.
   beside the destination, and renamed into place. A failed write cannot leave
   half a document, `-o` may name the input file, and a document that would not
   open is never left behind.
-- **No font work, and compression is opt-in.** Streams are carried over as they
-  are, so the output keeps the size of the input apart from the removed pages.
-  `--compress` flate-compresses streams that carry no filter at all; images and
-  streams that are already compressed are left alone.
+- **No recompression and no font work.** Streams are carried over as they are, so
+  the output keeps the size of the input apart from the removed pages. Rewriting
+  them for size is a different job, and one that would put content at risk for a
+  number that does not matter to this tool.
 - **Links into removed pages are dropped.** A file whose links pointed at page 12
   will lose those links if page 12 is gone; keeping them would keep the warnings.
 - **Bookmarks are pruned, not invented.** A merge splices every input's outline

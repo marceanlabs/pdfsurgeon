@@ -119,7 +119,6 @@ struct Parsed {
     /// Password for an encrypted input. Empty by default, which opens the
     /// common case of a file that only carries an owner password.
     password: Option<String>,
-    compress: bool,
     positional: Vec<OsString>,
 }
 
@@ -157,10 +156,6 @@ fn parse_args(args: &[OsString]) -> Res<Parsed> {
                 let value = args.get(i + 1).ok_or("--password needs a value")?;
                 parsed.password = Some(value.to_string_lossy().into_owned());
                 i += 2;
-            }
-            Some("--compress") => {
-                parsed.compress = true;
-                i += 1;
             }
             _ => {
                 parsed.positional.push(arg.clone());
@@ -226,16 +221,7 @@ fn load_plain(path: &Path, password: Option<&str>) -> Res<Document> {
 /// Write through a temporary file in the same directory and rename it into
 /// place, so a failed write cannot leave a half written document, and writing
 /// over the input file cannot destroy it.
-fn save(doc: &mut Document, out: &Path, compress: bool) -> Res<()> {
-    if compress {
-        // Only streams that carry no filter are touched: an image or an already
-        // compressed stream is left exactly as it is.
-        for object in doc.objects.values_mut() {
-            if let pdfsurgeon::lopdf::Object::Stream(stream) = object {
-                let _ = stream.compress();
-            }
-        }
-    }
+fn save(doc: &mut Document, out: &Path) -> Res<()> {
     if let Err(err) = verify(doc) {
         return Err(format!("{}: {err}; nothing was written", out.display()).into());
     }
@@ -332,7 +318,7 @@ fn cmd_merge(inputs: &[OsString], out: &Path, args: &Parsed) -> Res<()> {
         docs.push(load_plain(Path::new(input), args.password.as_deref())?);
     }
     let mut merged = pdfsurgeon::merge(docs)?;
-    save(&mut merged, out, args.compress)
+    save(&mut merged, out)
 }
 
 /// Split `file[:pages]` pieces into documents, then assemble them in order.
@@ -359,7 +345,7 @@ fn cmd_assemble(inputs: &[OsString], out: &Path, args: &Parsed) -> Res<()> {
     }
 
     let mut doc = pdfsurgeon::assemble(&sources, &pieces)?;
-    save(&mut doc, out, args.compress)
+    save(&mut doc, out)
 }
 
 /// `report.pdf:1-3` is a path and a page spec. `C:\report.pdf` and
@@ -407,7 +393,7 @@ fn cmd_split(path: &Path, out_dir: Option<PathBuf>, args: &Parsed) -> Res<()> {
     for (index, mut single) in pdfsurgeon::split(&source)?.into_iter().enumerate() {
         let page = index as u32 + 1;
         let name = format!("{stem}-{page:0width$}.pdf");
-        save(&mut single, &dir.join(name), args.compress)?;
+        save(&mut single, &dir.join(name))?;
     }
     Ok(())
 }
@@ -417,7 +403,7 @@ fn cmd_select(path: &Path, spec: &str, out: &Path, args: &Parsed) -> Res<()> {
     let total = source.get_pages().len() as u32;
     let keep = PageSpec::parse(spec, total)?;
     let mut doc = pdfsurgeon::select(&source, keep.pages())?;
-    save(&mut doc, out, args.compress)
+    save(&mut doc, out)
 }
 
 fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path, args: &Parsed) -> Res<()> {
@@ -425,7 +411,7 @@ fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path, args: &Parsed) ->
     let total = doc.get_pages().len() as u32;
     let pages = PageSpec::parse(spec, total)?;
     pdfsurgeon::rotate(&mut doc, pages.pages(), angle)?;
-    save(&mut doc, out, args.compress)
+    save(&mut doc, out)
 }
 
 #[cfg(test)]
