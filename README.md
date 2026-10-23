@@ -108,8 +108,8 @@ cargo build --release
 
 ## What is verified
 
-Seven integration tests build throwaway documents and check the result, rather
-than trusting the writer:
+Ten integration tests drive the binary and check the result, rather than
+trusting the writer:
 
 | Check | Test |
 |---|---|
@@ -123,6 +123,21 @@ than trusting the writer:
 | One file can be reordered in place | `assemble_can_reorder_within_one_file` |
 | A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
+
+`tests/edge_cases.rs` adds 35 more, against page trees written as raw bytes
+because the shapes that break page surgery are the ones a library's own writer
+never produces: attributes inherited from a `Pages` node, a `/Parent` cycle, a
+`/Count` that lies, the same page object listed twice in `/Kids`, a zero page
+document, an encrypted file, and a page asked for twice. Every output is walked
+object by object to prove it holds no reference to anything that is not there.
+
+The command line is tested the same way: flags before or after the file, a file
+named `-like-a-flag` after `--`, a path with a colon in it, a path that is not
+valid UTF-8, output written over the input, a write into a directory that does
+not exist (nothing is written, the input is untouched, no `.part` file is left),
+and four kinds of file that are not documents at all. Finally, 48 byte-mutated
+copies of a real document must either work or exit 1: the process is never
+allowed to crash.
 
 Beyond the test suite, the tool was checked against real files from two
 different producers, a 15 page paper and the 194 page RFC 9110, with poppler as
@@ -147,10 +162,28 @@ minutes.
 `merge` keeps everything from every input and builds one page tree over all of
 them, so links between the merged files' own pages keep working.
 
+Both rebuilds flatten the tree, so anything a page was inheriting from a `Pages`
+node above it, its resources, media box, crop box and rotation, is written onto
+the page itself on the way out. A page that leaves the old tree without those
+opens blank, or at the wrong size.
+
 ## What it deliberately does not do
 
-- **No decryption.** Encrypted files are reported, not opened.
-- **No repair.** Damaged files that lopdf cannot parse are refused.
+- **No decryption.** `info` reports an encrypted file; every command that would
+  rewrite it refuses instead of writing a document whose streams it cannot read.
+- **No repair.** Damaged files that lopdf cannot parse are refused, and so are
+  damaged files that parse only by guesswork: a stream whose `/Length` is
+  missing or does not match the bytes that were read would be copied without
+  its content, so the whole command stops instead.
+- **No catalogue beyond the pages.** `merge` builds one page tree and one
+  catalogue, so a named destination tree or an outline that lived in a source
+  catalogue does not travel with it. Links that used one become inert; nothing
+  is left pointing at a page that is not there.
+- **Nothing is written in place.** Output goes to a temporary file beside the
+  destination, is read back and checked (it must load, its catalogue must own a
+  page tree, every reference in it must land on an object), and only then is it
+  renamed into place. A failed write cannot leave half a document, `-o` may name
+  the input file, and a file that would not open is never left behind.
 - **No recompression or font work.** Streams are carried over; the output keeps
   the size of the input apart from the removed pages.
 - **Links into removed pages are dropped.** A file whose links pointed at page 12

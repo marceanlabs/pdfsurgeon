@@ -23,7 +23,7 @@
 //! `assemble` is the general case: pages from any number of inputs, in the
 //! order listed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub use lopdf;
@@ -47,6 +47,11 @@ pub enum Error {
     Angle(i64),
     /// The call needs at least one page or one input.
     Empty,
+    /// The document is encrypted, so its pages cannot be rewritten faithfully.
+    Encrypted,
+    /// A stream in the input is not the length its dictionary claims, which
+    /// means the file is damaged and copying it would quietly lose content.
+    Damaged(ObjectId),
 }
 
 impl fmt::Display for Error {
@@ -61,6 +66,12 @@ impl fmt::Display for Error {
             Error::MissingPage(number) => write!(f, "page {number} is missing"),
             Error::Angle(angle) => write!(f, "angle {angle} is not a multiple of 90"),
             Error::Empty => write!(f, "at least one page is required"),
+            Error::Encrypted => write!(f, "document is encrypted"),
+            Error::Damaged(id) => write!(
+                f,
+                "object {} {} is damaged: its stream is not the length its dictionary claims",
+                id.0, id.1
+            ),
         }
     }
 }
@@ -72,6 +83,92 @@ impl std::error::Error for Error {
             Error::Io(err) => Some(err),
             _ => None,
         }
+    }
+}
+
+/// Attributes a page takes from its ancestors when it does not carry them
+/// itself (PDF 32000-1, table 30). A page copied without them opens with no
+/// fonts, no size, or the wrong rotation.
+const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+
+/// The value `key` resolves to for `page`: the page's own value wins, then each
+/// `/Parent` in turn. `/Parent` cycles exist in broken files, so the walk
+/// remembers where it has been.
+fn inherited(doc: &Document, page: ObjectId, key: &[u8]) -> Option<Object> {
+    let mut seen = BTreeSet::new();
+    let mut current = Some(page);
+    while let Some(id) = current {
+        if !seen.insert(id) {
+            return None;
+        }
+        let dict = doc.get_dictionary(id).ok()?;
+        if let Ok(value) = dict.get(key) {
+            return Some(value.clone());
+        }
+        current = dict
+            .get(b"Parent")
+            .ok()
+            .and_then(|parent| parent.as_reference().ok());
+    }
+    None
+}
+
+/// Every inheritable attribute `page` does not carry itself, resolved and
+/// ready to be set on a copy of that page.
+fn inherited_missing(doc: &Document, page: ObjectId) -> Vec<(&'static [u8], Object)> {
+    let Ok(dict) = doc.get_dictionary(page) else {
+        return Vec::new();
+    };
+    let mut missing = Vec::new();
+    for key in INHERITABLE {
+        if dict.get(key).is_ok() {
+            continue;
+        }
+        if let Some(value) = inherited(doc, page, key) {
+            missing.push((key, value));
+        }
+    }
+    missing
+}
+
+/// Refuse a document whose streams do not hold what their dictionaries say.
+///
+/// A parser that recovers from a corrupt `/Length` can hand back an object with
+/// no content at all; writing that out would produce a document that opens and
+/// is missing a font or an image, which is worse than refusing the file.
+fn check_streams(doc: &Document) -> Result<()> {
+    for (id, object) in &doc.objects {
+        let Object::Stream(stream) = object else {
+            continue;
+        };
+        // A stream must say how long it is, directly or through a reference,
+        // and the number must match the bytes that were read. Anything else
+        // means the parser recovered the object by guessing, and a guess is
+        // not something to copy into a new file.
+        let Some(declared) = stream_length(doc, stream) else {
+            return Err(Error::Damaged(*id));
+        };
+        if declared < 0 || declared as usize != stream.content.len() {
+            return Err(Error::Damaged(*id));
+        }
+    }
+    Ok(())
+}
+
+fn stream_length(doc: &Document, stream: &lopdf::Stream) -> Option<i64> {
+    match stream.dict.get(b"Length").ok()? {
+        Object::Integer(value) => Some(*value),
+        Object::Reference(id) => doc.get_object(*id).ok()?.as_i64().ok(),
+        _ => None,
+    }
+}
+
+/// A page box number, whether the producer wrote it as an integer or a real.
+fn as_number(object: &Object) -> Option<f32> {
+    match object {
+        Object::Integer(value) => Some(*value as f32),
+        Object::Real(value) => Some(*value),
+        _ => None,
     }
 }
 
@@ -121,6 +218,18 @@ impl PageSpec {
                     if from == 0 || to < from {
                         return Err(Error::Spec(format!("bad range `{part}`")));
                     }
+                    // Bound the range before expanding it: `1-4000000000`
+                    // against a four page file must be a page error, not a
+                    // sixteen gigabyte allocation.
+                    if from > total {
+                        return Err(Error::Page {
+                            number: from,
+                            total,
+                        });
+                    }
+                    if to > total {
+                        return Err(Error::Page { number: to, total });
+                    }
                     pages.extend(from..=to);
                 }
                 None => pages.push(
@@ -163,15 +272,12 @@ pub struct Info {
 /// Read the structure of a document without touching the page content.
 pub fn info(doc: &Document) -> Info {
     let pages = doc.get_pages();
-    let page_size = pages
-        .values()
-        .next()
-        .and_then(|id| doc.get_dictionary(*id).ok())
-        .and_then(|dict| dict.get(b"MediaBox").ok().and_then(|o| o.as_array().ok()))
-        .and_then(|media| {
-            let nums: Vec<f32> = media.iter().filter_map(|o| o.as_float().ok()).collect();
-            (nums.len() == 4).then(|| (nums[2] - nums[0], nums[3] - nums[1]))
-        });
+    let page_size = pages.values().next().and_then(|id| {
+        let media = inherited(doc, *id, b"MediaBox")?;
+        let media = media.as_array().ok()?;
+        let nums: Vec<f32> = media.iter().filter_map(as_number).collect();
+        (nums.len() == 4).then(|| (nums[2] - nums[0], nums[3] - nums[1]))
+    });
     Info {
         version: doc.version.clone(),
         pages: pages.len(),
@@ -188,6 +294,10 @@ pub fn select(doc: &Document, pages: &[u32]) -> Result<Document> {
     if pages.is_empty() {
         return Err(Error::Empty);
     }
+    if doc.is_encrypted() {
+        return Err(Error::Encrypted);
+    }
+    check_streams(doc)?;
     let by_number = doc.get_pages();
     let total = by_number.len() as u32;
     let mut ids = Vec::with_capacity(pages.len());
@@ -229,6 +339,12 @@ pub fn assemble(sources: &[Document], pieces: &[Piece]) -> Result<Document> {
     if pieces.is_empty() {
         return Err(Error::Empty);
     }
+    if sources.iter().any(Document::is_encrypted) {
+        return Err(Error::Encrypted);
+    }
+    for source in sources {
+        check_streams(source)?;
+    }
     let maps: Vec<BTreeMap<u32, ObjectId>> = sources.iter().map(Document::get_pages).collect();
     let mut keys: Vec<(usize, ObjectId)> = Vec::new();
     for piece in pieces {
@@ -259,13 +375,45 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     if sources.is_empty() {
         return Err(Error::Empty);
     }
+    if sources.iter().any(Document::is_encrypted) {
+        return Err(Error::Encrypted);
+    }
+    for source in &sources {
+        check_streams(source)?;
+    }
     let mut out = Document::with_version(sources[0].version.clone());
     let mut offset: u32 = 0;
     let mut page_ids: Vec<ObjectId> = Vec::new();
 
     for doc in sources {
         let by_number = doc.get_pages();
+        // Where the next document's ids start. Taken from the objects that are
+        // actually there, never from `max_id`: a damaged trailer can claim four
+        // hundred million objects, and shifting by that writes a file no reader
+        // will open.
+        let span = doc
+            .objects
+            .keys()
+            .map(|(number, _)| *number as u64)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        if span > 10_000_000 || offset as u64 + span > u32::MAX as u64 {
+            return Err(Error::Damaged((span.min(u32::MAX as u64) as u32, 0)));
+        }
+        let span = span as u32;
         page_ids.extend(by_number.values().map(|(n, g)| (n + offset, *g)));
+
+        // Pages keep their own dictionaries, but the tree they used to hang
+        // from is thrown away, so anything they inherited from it has to be
+        // written onto them here or the page opens without fonts or a size.
+        let mut carried: BTreeMap<ObjectId, Vec<(&'static [u8], Object)>> = BTreeMap::new();
+        for id in by_number.values() {
+            let missing = inherited_missing(&doc, *id);
+            if !missing.is_empty() {
+                carried.insert(*id, missing);
+            }
+        }
 
         for (id, mut object) in doc.objects {
             match object.type_name().unwrap_or(b"") {
@@ -273,10 +421,17 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
                 b"Catalog" | b"Pages" => continue,
                 _ => {}
             }
+            if let Some(attributes) = carried.get(&id) {
+                if let Object::Dictionary(dict) = &mut object {
+                    for (key, value) in attributes {
+                        dict.set(*key, value.clone());
+                    }
+                }
+            }
             shift_refs(&mut object, offset);
             out.objects.insert((id.0 + offset, id.1), object);
         }
-        offset += doc.max_id + 1;
+        offset += span;
     }
 
     // Every page needs the new tree as its parent, and ids were inserted
@@ -347,6 +502,10 @@ pub fn rotate(doc: &mut Document, pages: &[u32], angle: i64) -> Result<()> {
     if pages.is_empty() {
         return Err(Error::Empty);
     }
+    if doc.is_encrypted() {
+        return Err(Error::Encrypted);
+    }
+    check_streams(doc)?;
     let by_number = doc.get_pages();
     let total = by_number.len() as u32;
     for number in pages {
@@ -354,13 +513,13 @@ pub fn rotate(doc: &mut Document, pages: &[u32], angle: i64) -> Result<()> {
             number: *number,
             total,
         })?;
-        let dict = doc.get_dictionary_mut(id)?;
-        let current = dict
-            .get(b"Rotate")
-            .ok()
+        // A page that inherits its rotation from a Pages node still has that
+        // rotation in a reader, so the new value starts from what it inherits.
+        let current = inherited(doc, id, b"Rotate")
             .and_then(|o| o.as_i64().ok())
             .unwrap_or(0);
-        let updated = ((current + angle) % 360 + 360) % 360;
+        let dict = doc.get_dictionary_mut(id)?;
+        let updated = (current.rem_euclid(360) + angle.rem_euclid(360)) % 360;
         dict.set("Rotate", updated);
     }
     Ok(())
@@ -401,6 +560,11 @@ fn extract_from(sources: &[Document], keys: &[(usize, ObjectId)]) -> Document {
         {
             // The parent is provided by the new page tree, not copied.
             dict.remove(b"Parent");
+            // The new tree is flat, so anything the page inherited from the
+            // old one has to be written onto the page itself or it is lost.
+            for (key, value) in inherited_missing(&sources[key.0], key.1) {
+                dict.set(key, value);
+            }
         }
         remap(&mut object, key.0, &mut map, &mut queue, &mut next);
         out.objects.insert(new, object);
@@ -415,6 +579,14 @@ fn extract_from(sources: &[Document], keys: &[(usize, ObjectId)]) -> Document {
             "Count" => keys.len() as i64,
         }),
     );
+
+    // Each copied page was stripped of its old parent, so the new tree has to
+    // adopt it: a page without /Parent is not a valid page.
+    for key in keys {
+        if let Ok(dict) = out.get_dictionary_mut(map[key]) {
+            dict.set("Parent", pages_id);
+        }
+    }
 
     out.max_id = next - 1;
     let catalog_id = out.add_object(dictionary! {

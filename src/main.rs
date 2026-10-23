@@ -1,5 +1,6 @@
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,9 @@ assemble takes pages from any number of files, in the order given:
     pdfsurgeon assemble -o out.pdf report.pdf:1-3 appendix.pdf invoices.pdf:2
 
 Angles are multiples of 90 and are added to any rotation a page already has.
+
+Flags may come before or after the files. `--` ends flag parsing, so a file
+whose name starts with a dash can still be named.
 ";
 
 fn main() {
@@ -37,84 +41,213 @@ fn main() {
 }
 
 fn run() -> Res<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    // OsString, not String: a path that is not valid UTF-8 is still a path,
+    // and `env::args()` would panic on it.
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
     let Some(command) = args.first() else {
         print!("{USAGE}");
         return Ok(());
     };
 
-    match command.as_str() {
+    match command.to_str().unwrap_or("") {
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
         }
         "info" => {
-            let file = args.get(1).ok_or("info needs a file")?;
+            let parsed = parse_args(&args[1..])?;
+            one_file(&parsed)?;
+            let file = parsed.positional.first().ok_or("info needs a file")?;
             cmd_info(Path::new(file))
         }
         "merge" => {
-            let (out, inputs) = take_out(&args[1..])?;
-            let out = out.ok_or("merge needs -o <out.pdf>")?;
-            cmd_merge(&inputs, &out)
+            let args = parse_args(&args[1..])?;
+            let out = args.out.ok_or("merge needs -o <out.pdf>")?;
+            cmd_merge(&args.positional, &out)
         }
         "assemble" => {
-            let (out, inputs) = take_out(&args[1..])?;
-            let out = out.ok_or("assemble needs -o <out.pdf>")?;
-            cmd_assemble(&inputs, &out)
+            let args = parse_args(&args[1..])?;
+            let out = args.out.ok_or("assemble needs -o <out.pdf>")?;
+            cmd_assemble(&args.positional, &out)
         }
         "split" => {
-            let (out, rest) = take_out(&args[1..])?;
-            let file = rest.first().ok_or("split needs a file")?;
-            cmd_split(Path::new(file), out)
+            let args = parse_args(&args[1..])?;
+            one_file(&args)?;
+            let file = args.positional.first().ok_or("split needs a file")?;
+            cmd_split(Path::new(file), args.out)
         }
         "select" => {
-            let (out, rest) = take_out(&args[1..])?;
-            let out = out.ok_or("select needs -o <out.pdf>")?;
-            let file = rest.first().ok_or("select needs a file")?;
-            let spec = take_flag(&args[1..], "--pages").ok_or("select needs --pages")?;
+            let args = parse_args(&args[1..])?;
+            one_file(&args)?;
+            let out = args.out.ok_or("select needs -o <out.pdf>")?;
+            let file = args.positional.first().ok_or("select needs a file")?;
+            let spec = args.pages.ok_or("select needs --pages")?;
             cmd_select(Path::new(file), &spec, &out)
         }
         "rotate" => {
-            let (out, rest) = take_out(&args[1..])?;
-            let out = out.ok_or("rotate needs -o <out.pdf>")?;
-            let file = rest.first().ok_or("rotate needs a file")?;
-            let spec = take_flag(&args[1..], "--pages").ok_or("rotate needs --pages")?;
-            let angle: i64 = take_flag(&args[1..], "--angle")
+            let args = parse_args(&args[1..])?;
+            one_file(&args)?;
+            let out = args.out.ok_or("rotate needs -o <out.pdf>")?;
+            let file = args.positional.first().ok_or("rotate needs a file")?;
+            let spec = args.pages.ok_or("rotate needs --pages")?;
+            let angle: i64 = args
+                .angle
                 .ok_or("rotate needs --angle")?
-                .parse()?;
+                .parse()
+                .map_err(|_| "angle must be a whole number of degrees")?;
             cmd_rotate(Path::new(file), &spec, angle, &out)
         }
         other => Err(format!("unknown command `{other}`\n\n{USAGE}").into()),
     }
 }
 
-/// Pull `-o <path>` or `--out <path>` out of the arguments, returning it and
-/// everything else.
-fn take_out(args: &[String]) -> Res<(Option<PathBuf>, Vec<String>)> {
-    let mut out = None;
-    let mut rest = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "-o" || args[i] == "--out" {
-            let value = args.get(i + 1).ok_or("-o needs a path")?;
-            out = Some(PathBuf::from(value));
-            i += 2;
-        } else {
-            rest.push(args[i].clone());
-            i += 1;
-        }
-    }
-    Ok((out, rest))
+#[derive(Default)]
+struct Parsed {
+    out: Option<PathBuf>,
+    pages: Option<String>,
+    angle: Option<String>,
+    positional: Vec<OsString>,
 }
 
-/// Pull `--name <value>` out of the arguments.
-fn take_flag(args: &[String], name: &str) -> Option<String> {
-    let pos = args.iter().position(|a| a == name)?;
-    args.get(pos + 1).cloned()
+/// One pass over the arguments, so order does not matter and a flag value is
+/// never mistaken for a file. `--` ends flag parsing, so a file may be named
+/// `-o` or `--pages`.
+fn parse_args(args: &[OsString]) -> Res<Parsed> {
+    let mut parsed = Parsed::default();
+    let mut i = 0;
+    let mut flags = true;
+    while i < args.len() {
+        let arg = &args[i];
+        let name = if flags { arg.to_str() } else { None };
+        match name {
+            Some("--") => {
+                flags = false;
+                i += 1;
+            }
+            Some("-o") | Some("--out") => {
+                let value = args.get(i + 1).ok_or("-o needs a path")?;
+                parsed.out = Some(PathBuf::from(value));
+                i += 2;
+            }
+            Some("--pages") => {
+                let value = args.get(i + 1).ok_or("--pages needs a value")?;
+                parsed.pages = Some(spec_text(value.clone())?);
+                i += 2;
+            }
+            Some("--angle") => {
+                let value = args.get(i + 1).ok_or("--angle needs a value")?;
+                parsed.angle = Some(spec_text(value.clone())?);
+                i += 2;
+            }
+            _ => {
+                parsed.positional.push(arg.clone());
+                i += 1;
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// Commands that work on one document reject a second one, so a mistyped flag
+/// is an error rather than something silently ignored.
+fn one_file(args: &Parsed) -> Res<()> {
+    match args.positional.get(1) {
+        Some(extra) => Err(format!("unexpected argument `{}`", extra.to_string_lossy()).into()),
+        None => Ok(()),
+    }
+}
+
+/// A page spec is ASCII digits, commas and hyphens, so anything that is not a
+/// string cannot be one.
+fn spec_text(value: OsString) -> Res<String> {
+    value
+        .into_string()
+        .map_err(|_| "page spec must be plain text".into())
+}
+
+/// Load with the path in the message: "IO error" on its own does not say which
+/// file was missing.
+fn load(path: &Path) -> Res<Document> {
+    Document::load(path).map_err(|err| format!("{}: {err}", path.display()).into())
+}
+
+/// Everything that rewrites pages needs a document it can actually read. An
+/// encrypted file parses far enough to report itself and then yields an empty
+/// page tree, which is worse than an error.
+fn load_plain(path: &Path) -> Res<Document> {
+    let doc = load(path)?;
+    if doc.is_encrypted() {
+        return Err(format!("{}: encrypted PDFs are not supported", path.display()).into());
+    }
+    Ok(doc)
+}
+
+/// Write through a temporary file in the same directory and rename it into
+/// place, so a failed write cannot leave a half written document, and writing
+/// over the input file cannot destroy it.
+fn save(doc: &mut Document, out: &Path) -> Res<()> {
+    let temp = temp_path(out);
+    doc.save(&temp)
+        .map_err(|err| format!("{}: {err}", out.display()))?;
+    if let Err(err) = verify(&temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("{}: {err}; nothing was written", out.display()).into());
+    }
+    fs::rename(&temp, out).map_err(|err| {
+        let _ = fs::remove_file(&temp);
+        format!("{}: {err}", out.display())
+    })?;
+    Ok(())
+}
+
+/// Read back what was just written and check the two things that make it
+/// usable: it loads, and every reference in it lands on an object. Writing a
+/// file that only opens by luck is the one failure mode worth spending a
+/// second parse on.
+fn verify(path: &Path) -> Res<()> {
+    let doc = Document::load(path)?;
+    let catalog = doc.catalog()?;
+    if catalog.get(b"Pages").is_err() {
+        return Err("the new catalogue has no page tree".into());
+    }
+    let mut stack: Vec<&pdfsurgeon::lopdf::Object> = doc.objects.values().collect();
+    while let Some(object) = stack.pop() {
+        match object {
+            pdfsurgeon::lopdf::Object::Reference(id) => {
+                if !doc.objects.contains_key(id) {
+                    return Err(format!(
+                        "the new file points at object {} {}, which is not in it",
+                        id.0, id.1
+                    )
+                    .into());
+                }
+            }
+            pdfsurgeon::lopdf::Object::Dictionary(dict) => {
+                stack.extend(dict.iter().map(|(_, value)| value));
+            }
+            pdfsurgeon::lopdf::Object::Array(items) => stack.extend(items.iter()),
+            pdfsurgeon::lopdf::Object::Stream(stream) => {
+                if stream.dict.get(b"Length").is_err() {
+                    return Err("the new file has a stream with no length".into());
+                }
+                stack.extend(stream.dict.iter().map(|(_, value)| value));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn temp_path(out: &Path) -> PathBuf {
+    let name = out
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out.pdf".to_string());
+    out.with_file_name(format!(".{name}.{}.part", std::process::id()))
 }
 
 fn cmd_info(path: &Path) -> Res<()> {
-    let doc = Document::load(path)?;
+    let doc = load(path)?;
     let info = pdfsurgeon::info(&doc);
     println!("file:      {}", path.display());
     println!("version:   {}", info.version);
@@ -126,30 +259,32 @@ fn cmd_info(path: &Path) -> Res<()> {
     Ok(())
 }
 
-fn cmd_merge(inputs: &[String], out: &Path) -> Res<()> {
+fn cmd_merge(inputs: &[OsString], out: &Path) -> Res<()> {
+    if inputs.is_empty() {
+        return Err("merge needs at least one input file".into());
+    }
     let mut docs = Vec::with_capacity(inputs.len());
     for input in inputs {
-        docs.push(Document::load(input)?);
+        docs.push(load_plain(Path::new(input))?);
     }
     let mut merged = pdfsurgeon::merge(docs)?;
-    merged.save(out)?;
-    Ok(())
+    save(&mut merged, out)
 }
 
 /// Split `file[:pages]` pieces into documents, then assemble them in order.
-fn cmd_assemble(inputs: &[String], out: &Path) -> Res<()> {
+fn cmd_assemble(inputs: &[OsString], out: &Path) -> Res<()> {
+    if inputs.is_empty() {
+        return Err("assemble needs at least one input file".into());
+    }
     let mut sources: Vec<Document> = Vec::new();
     let mut pieces: Vec<Piece> = Vec::new();
 
-    for piece in inputs {
-        let (path, spec) = match piece.rsplit_once(':') {
-            Some((path, spec)) if !path.is_empty() && !spec.is_empty() => (path, Some(spec)),
-            _ => (piece.as_str(), None),
-        };
-        let doc = Document::load(path)?;
+    for input in inputs {
+        let (path, spec) = split_piece(input);
+        let doc = load_plain(&path)?;
         let total = doc.get_pages().len() as u32;
         let pages = match spec {
-            Some(spec) => PageSpec::parse(spec, total)?.pages().to_vec(),
+            Some(spec) => PageSpec::parse(&spec, total)?.pages().to_vec(),
             None => (1..=total).collect(),
         };
         pieces.push(Piece {
@@ -160,46 +295,67 @@ fn cmd_assemble(inputs: &[String], out: &Path) -> Res<()> {
     }
 
     let mut doc = pdfsurgeon::assemble(&sources, &pieces)?;
-    doc.save(out)?;
-    Ok(())
+    save(&mut doc, out)
+}
+
+/// `report.pdf:1-3` is a path and a page spec. `C:\report.pdf` and
+/// `odd:name.pdf` are just paths, so only a suffix that reads as a spec is
+/// taken as one.
+fn split_piece(piece: &OsString) -> (PathBuf, Option<String>) {
+    if let Some(text) = piece.to_str() {
+        if let Some((path, spec)) = text.rsplit_once(':') {
+            if !path.is_empty() && looks_like_spec(spec) {
+                return (PathBuf::from(path), Some(spec.to_string()));
+            }
+        }
+    }
+    (PathBuf::from(piece), None)
+}
+
+fn looks_like_spec(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().any(|c| c.is_ascii_digit())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ',' || c == '-' || c == ' ')
 }
 
 fn cmd_split(path: &Path, out_dir: Option<PathBuf>) -> Res<()> {
-    let source = Document::load(path)?;
+    let source = load_plain(path)?;
     let total = source.get_pages().len() as u32;
     let dir = out_dir.unwrap_or_else(|| {
         path.parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
     });
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    if !dir.is_dir() {
+        return Err(format!("{}: not a directory", dir.display()).into());
+    }
     let stem = path
         .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("page")
-        .to_string();
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "page".to_string());
 
     for page in 1..=total {
         let mut single = pdfsurgeon::select(&source, &[page])?;
-        single.save(dir.join(format!("{stem}-{page:03}.pdf")))?;
+        save(&mut single, &dir.join(format!("{stem}-{page:03}.pdf")))?;
     }
     Ok(())
 }
 
 fn cmd_select(path: &Path, spec: &str, out: &Path) -> Res<()> {
-    let source = Document::load(path)?;
+    let source = load_plain(path)?;
     let total = source.get_pages().len() as u32;
     let keep = PageSpec::parse(spec, total)?;
     let mut doc = pdfsurgeon::select(&source, keep.pages())?;
-    doc.save(out)?;
-    Ok(())
+    save(&mut doc, out)
 }
 
 fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path) -> Res<()> {
-    let mut doc = Document::load(path)?;
+    let mut doc = load_plain(path)?;
     let total = doc.get_pages().len() as u32;
     let pages = PageSpec::parse(spec, total)?;
     pdfsurgeon::rotate(&mut doc, pages.pages(), angle)?;
-    doc.save(out)?;
-    Ok(())
+    save(&mut doc, out)
 }

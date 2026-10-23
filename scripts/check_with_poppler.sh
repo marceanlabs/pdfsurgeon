@@ -36,6 +36,19 @@ for input in "$@"; do
       echo "  FAIL  poppler complains about $(basename "$out")"
       status=1
     fi
+    # qpdf is stricter than poppler: it checks the cross reference table and
+    # every key it knows, so a page without /Parent or a stale reference shows
+    # up here even though a reader would tolerate it.
+    if command -v qpdf >/dev/null; then
+      if report=$(qpdf --check "$out" 2>&1); then
+        :
+      elif printf '%s' "$report" | grep -q "Permission denied"; then
+        : # qpdf cannot open files in this directory; not a verdict on the file
+      else
+        echo "  FAIL  qpdf --check rejects $(basename "$out")"
+        status=1
+      fi
+    fi
   done
 
   if command -v pdftotext >/dev/null; then
