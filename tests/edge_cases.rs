@@ -1202,11 +1202,10 @@ fn the_help_text_and_a_bare_invocation_succeed() {
 
 #[test]
 fn mutated_documents_fail_cleanly_and_never_crash() {
+    // Both shapes: a plain nested tree, and one carrying links, a name tree and
+    // an outline, so the destination and bookmark code is fuzzed too.
+    let fixtures: [(&str, fn(&Path)); 2] = [("nested", nested_tree), ("linked", linked_document)];
     let dir = scratch("fuzz");
-    let base = dir.join("base.pdf");
-    nested_tree(&base);
-    let original = fs::read(&base).unwrap();
-
     let mut state: u64 = 0x5eed;
     let mut next = || {
         state ^= state << 13;
@@ -1215,41 +1214,46 @@ fn mutated_documents_fail_cleanly_and_never_crash() {
         state
     };
 
-    for case in 0..48 {
-        let mut bytes = original.clone();
-        let flips = 1 + (next() % 8) as usize;
-        for _ in 0..flips {
-            let at = (next() as usize) % bytes.len();
-            bytes[at] = (next() % 256) as u8;
-        }
-        let file = dir.join(format!("mutated-{case}.pdf"));
-        fs::write(&file, &bytes).unwrap();
+    for (name, build) in fixtures {
+        let base = dir.join(format!("{name}-base.pdf"));
+        build(&base);
+        let original = fs::read(&base).unwrap();
+        for case in 0..48 {
+            let mut bytes = original.clone();
+            let flips = 1 + (next() % 8) as usize;
+            for _ in 0..flips {
+                let at = (next() as usize) % bytes.len();
+                bytes[at] = (next() % 256) as u8;
+            }
+            let file = dir.join(format!("{name}-mutated-{case}.pdf"));
+            fs::write(&file, &bytes).unwrap();
 
-        let out = dir.join(format!("mutated-{case}-out.pdf"));
-        for args in [
-            vec!["info", file.to_str().unwrap()],
-            vec![
-                "select",
-                file.to_str().unwrap(),
-                "--pages",
-                "1",
-                "-o",
-                out.to_str().unwrap(),
-            ],
-            vec!["merge", "-o", out.to_str().unwrap(), file.to_str().unwrap()],
-        ] {
-            let output = cli(&args);
-            let code = output.status.code();
-            assert!(
-                code == Some(0) || code == Some(1),
-                "case {case} {args:?} ended with {code:?}: {}",
-                stderr(&output)
-            );
-            if code == Some(0) && args[0] != "info" {
-                // Anything it claims to have written has to be readable.
-                Document::load(&out).unwrap_or_else(|err| {
-                    panic!("case {case} {args:?} wrote an unreadable file: {err}")
-                });
+            let out = dir.join(format!("{name}-mutated-{case}-out.pdf"));
+            for args in [
+                vec!["info", file.to_str().unwrap()],
+                vec![
+                    "select",
+                    file.to_str().unwrap(),
+                    "--pages",
+                    "1",
+                    "-o",
+                    out.to_str().unwrap(),
+                ],
+                vec!["merge", "-o", out.to_str().unwrap(), file.to_str().unwrap()],
+            ] {
+                let output = cli(&args);
+                let code = output.status.code();
+                assert!(
+                    code == Some(0) || code == Some(1),
+                    "case {case} {args:?} ended with {code:?}: {}",
+                    stderr(&output)
+                );
+                if code == Some(0) && args[0] != "info" {
+                    // Anything it claims to have written has to be readable.
+                    Document::load(&out).unwrap_or_else(|err| {
+                        panic!("case {name} {case} {args:?} wrote an unreadable file: {err}")
+                    });
+                }
             }
         }
     }
