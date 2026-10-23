@@ -588,6 +588,8 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     // Top level chains of each source outline, in output ids.
     let mut outlines: Vec<(ObjectId, i64)> = Vec::new();
     let mut forms: Vec<SourceForm> = Vec::new();
+    let mut page_labels_out: Vec<(u32, String)> = Vec::new();
+    let mut embedded: Vec<(Vec<u8>, ObjectId)> = Vec::new();
 
     for doc in sources {
         let by_number = doc.get_pages();
@@ -606,7 +608,17 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
             return Err(Error::Damaged((span.min(u32::MAX as u64) as u32, 0)));
         }
         let span = span as u32;
+        let first_page_index = page_ids.len() as u32;
         page_ids.extend(by_number.values().map(|(n, g)| (n + offset, *g)));
+
+        for (index, label) in page_labels(&doc).into_iter().enumerate() {
+            if let Some(label) = label {
+                page_labels_out.push((first_page_index + index as u32, label));
+            }
+        }
+        for (name, id) in embedded_files(&doc) {
+            embedded.push((name, (id.0 + offset, id.1)));
+        }
 
         let names = named_destinations(&doc);
         if let Some(form) = doc
@@ -714,8 +726,14 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     {
         catalog.set("Metadata", metadata.clone());
     }
-    if let Some(acroform) = merge_forms(&mut out, &forms) {
+    if let Some(acroform) = merge_forms(&mut out, &forms, &page_ids) {
         catalog.set("AcroForm", acroform);
+    }
+    if let Some(labels) = write_page_labels(&mut out, &page_labels_out) {
+        catalog.set("PageLabels", labels);
+    }
+    if let Some(names) = write_embedded_files(&mut out, &embedded) {
+        catalog.set("Names", names);
     }
     let catalog_id = out.add_object(catalog);
     out.trailer.set("Root", catalog_id);
@@ -978,6 +996,30 @@ fn extract_with_names(
     } else {
         None
     };
+    // Page labels and attachments belong to the document, not to a page, so
+    // they only make sense when the pages come from one file.
+    let mut labels: Vec<(u32, String)> = Vec::new();
+    let mut attached: Vec<(Vec<u8>, ObjectId)> = Vec::new();
+    if sources.len() == 1 {
+        let numbers: BTreeMap<ObjectId, u32> = sources[0]
+            .get_pages()
+            .into_iter()
+            .map(|(number, id)| (id, number))
+            .collect();
+        let all = page_labels(&sources[0]);
+        for (position, (_, id)) in keys.iter().enumerate() {
+            if let Some(number) = numbers.get(id)
+                && let Some(Some(text)) = all.get(*number as usize - 1)
+            {
+                labels.push((position as u32, text.clone()));
+            }
+        }
+        for (name, filespec) in embedded_files(&sources[0]) {
+            if let Some(id) = copy_filespec(&sources[0], &mut out, filespec) {
+                attached.push((name, id));
+            }
+        }
+    }
     let mut catalog = dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
@@ -987,6 +1029,12 @@ fn extract_with_names(
     }
     if let Some(metadata) = metadata {
         catalog.set("Metadata", metadata);
+    }
+    if let Some(labels) = write_page_labels(&mut out, &labels) {
+        catalog.set("PageLabels", labels);
+    }
+    if let Some(names) = write_embedded_files(&mut out, &attached) {
+        catalog.set("Names", names);
     }
     if let Some(outlines_id) = outlines {
         catalog.set("Outlines", outlines_id);
@@ -1281,7 +1329,7 @@ fn read_source_form(doc: &Document, base: u32, form: Object) -> Option<SourceFor
 /// Two documents that both call a font `/Helv` are fine when it is the same
 /// font; when it is not, the later one is renamed and the appearance strings
 /// that named it are rewritten to match.
-fn merge_forms(out: &mut Document, forms: &[SourceForm]) -> Option<ObjectId> {
+fn merge_forms(out: &mut Document, forms: &[SourceForm], pages: &[ObjectId]) -> Option<ObjectId> {
     let usable: Vec<&SourceForm> = forms
         .iter()
         .filter(|form| !form.xfa && !form.fields.is_empty())
@@ -1291,10 +1339,19 @@ fn merge_forms(out: &mut Document, forms: &[SourceForm]) -> Option<ObjectId> {
     }
 
     let mut roots: Vec<(usize, ObjectId)> = Vec::new();
+    let mut signed: BTreeSet<ObjectId> = BTreeSet::new();
     for (index, form) in usable.iter().enumerate() {
         for id in &form.fields {
             let shifted = (id.0 + form.base, id.1);
             if !out.objects.contains_key(&shifted) {
+                continue;
+            }
+            // A signature covers the bytes of the file it was made in. Page
+            // surgery changes those bytes, so the signature cannot be carried
+            // and a field showing one would be a claim that fails the moment a
+            // reader checks it.
+            if field_type(out, shifted).as_deref() == Some(b"Sig") {
+                widget_ids(out, shifted, 0, &mut signed);
                 continue;
             }
             strip_actions(out, shifted, 0);
@@ -1340,6 +1397,7 @@ fn merge_forms(out: &mut Document, forms: &[SourceForm]) -> Option<ObjectId> {
         let dr = out.add_object(resources);
         acroform.set("DR", dr);
     }
+    strip_annotations(out, pages, &signed);
     let first = usable[0];
     if let Some(da) = &first.da {
         acroform.set("DA", da.clone());
@@ -1761,6 +1819,7 @@ fn build_extracted_form(
     // Widgets on the pages that were kept, in page order.
     let mut kept: BTreeMap<usize, BTreeSet<ObjectId>> = BTreeMap::new();
     let mut order: Vec<(usize, ObjectId)> = Vec::new();
+    let mut signed: BTreeSet<ObjectId> = BTreeSet::new();
     for (source, page) in keys {
         let Ok(dict) = sources[*source].get_dictionary(*page) else {
             continue;
@@ -1778,12 +1837,24 @@ fn build_extracted_form(
             if !is_widget(annot) {
                 continue;
             }
+            // A signature covers bytes this document no longer has.
+            if field_type(&sources[*source], id).as_deref() == Some(b"Sig") {
+                if let Some(existing) = map.get(&(*source, id)) {
+                    signed.insert(*existing);
+                }
+                continue;
+            }
             let entry = kept.entry(*source).or_default();
             if entry.insert(id) {
                 order.push((*source, id));
             }
         }
     }
+    let output_pages: Vec<ObjectId> = keys
+        .iter()
+        .filter_map(|key| map.get(key).copied())
+        .collect();
+    strip_annotations(out, &output_pages, &signed);
     if order.is_empty() {
         return None;
     }
@@ -1917,6 +1988,73 @@ fn build_extracted_form(
     Some(out.add_object(acroform))
 }
 
+/// Put the embedded files of every input into one name tree.
+///
+/// Two inputs can attach files of the same name. The name tree needs unique
+/// keys, so the later one is renamed rather than dropped.
+fn write_embedded_files(out: &mut Document, files: &[(Vec<u8>, ObjectId)]) -> Option<ObjectId> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut taken: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut pairs: Vec<Object> = Vec::with_capacity(files.len() * 2);
+    for (name, id) in files {
+        let unique = unique_attachment_name(&taken, name);
+        taken.insert(unique.clone());
+        pairs.push(Object::String(unique, lopdf::StringFormat::Literal));
+        pairs.push(Object::Reference(*id));
+    }
+    let tree = out.add_object(dictionary! { "Names" => pairs });
+    Some(out.add_object(dictionary! { "EmbeddedFiles" => tree }))
+}
+
+fn unique_attachment_name(taken: &BTreeSet<Vec<u8>>, name: &[u8]) -> Vec<u8> {
+    if !taken.contains(name) {
+        return name.to_vec();
+    }
+    // Keep the extension where there is one, so the file still opens as itself.
+    let (stem, extension) = match name.iter().rposition(|byte| *byte == b'.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, &b""[..]),
+    };
+    for suffix in 2.. {
+        let candidate = [stem, format!(" ({suffix})").as_bytes(), extension].concat();
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Copy a file specification and the stream it points at. Neither is reachable
+/// from a page, so an extraction has to carry them across on purpose.
+fn copy_filespec(source: &Document, out: &mut Document, id: ObjectId) -> Option<ObjectId> {
+    let mut filespec = source.get_dictionary(id).ok()?.clone();
+    if let Some(embedded) = filespec.get(b"EF").ok().and_then(|ef| ef.as_dict().ok()) {
+        let mut carried = Dictionary::new();
+        for (key, value) in embedded.iter() {
+            let Ok(stream_id) = value.as_reference() else {
+                continue;
+            };
+            let Ok(Object::Stream(stream)) = source.get_object(stream_id) else {
+                continue;
+            };
+            let mut stream = stream.clone();
+            if stream.dict.iter().any(|(_, value)| has_reference(value)) {
+                continue;
+            }
+            stream.dict.set("Length", stream.content.len() as i64);
+            carried.set(key.to_vec(), Object::Reference(out.add_object(stream)));
+        }
+        if carried.is_empty() {
+            filespec.remove(b"EF");
+        } else {
+            filespec.set("EF", carried);
+        }
+    }
+    Some(out.add_object(filespec))
+}
+
 /// Copy the XMP packet of `source` across. It is a stream of text with no
 /// pointers of its own, so it can be moved as it stands; one that does hold a
 /// reference is left behind rather than copied with a dead pointer.
@@ -1945,6 +2083,284 @@ fn acroform_dict(source: &Document) -> Option<Dictionary> {
         Object::Reference(id) => source.get_dictionary(id).ok().cloned(),
         Object::Dictionary(dict) => Some(dict),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// signatures, page labels and embedded files
+// ---------------------------------------------------------------------------
+
+/// The field type of `id`, following `/Parent` because a child widget inherits
+/// it from the field above.
+fn field_type(source: &Document, mut id: ObjectId) -> Option<Vec<u8>> {
+    let mut seen = BTreeSet::new();
+    loop {
+        if !seen.insert(id) {
+            return None;
+        }
+        let dict = source.get_dictionary(id).ok()?;
+        if let Ok(kind) = dict.get(b"FT").and_then(|kind| kind.as_name()) {
+            return Some(kind.to_vec());
+        }
+        id = dict
+            .get(b"Parent")
+            .ok()
+            .and_then(|parent| parent.as_reference().ok())?;
+    }
+}
+
+/// Every widget under `id`, in any document.
+fn widget_ids(doc: &Document, id: ObjectId, depth: usize, into: &mut BTreeSet<ObjectId>) {
+    if depth > 32 {
+        return;
+    }
+    let Ok(dict) = doc.get_dictionary(id) else {
+        return;
+    };
+    if is_widget(dict) {
+        into.insert(id);
+    }
+    if let Ok(kids) = dict.get(b"Kids").and_then(|kids| kids.as_array()) {
+        for kid in kids {
+            if let Ok(kid) = kid.as_reference() {
+                widget_ids(doc, kid, depth + 1, into);
+            }
+        }
+    }
+}
+
+/// Take annotations out of the pages they sit on.
+///
+/// Used for signature widgets: a signature cannot survive page surgery, and a
+/// widget whose field was dropped is not a valid annotation any more.
+fn strip_annotations(out: &mut Document, pages: &[ObjectId], removed: &BTreeSet<ObjectId>) {
+    if removed.is_empty() {
+        return;
+    }
+    for page in pages.iter().copied() {
+        let keep: Vec<Object> = match out.get_dictionary(page) {
+            Ok(dict) => dict
+                .get(b"Annots")
+                .ok()
+                .and_then(|annots| annots.as_array().ok())
+                .map(|annots| {
+                    annots
+                        .iter()
+                        .filter(|annot| match annot {
+                            Object::Reference(id) => !removed.contains(id),
+                            _ => true,
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => continue,
+        };
+        if let Ok(dict) = out.get_dictionary_mut(page) {
+            if keep.is_empty() {
+                dict.remove(b"Annots");
+            } else {
+                dict.set("Annots", keep);
+            }
+        }
+    }
+}
+
+/// The label of every page, from the catalogue's `/PageLabels` number tree.
+fn page_labels(doc: &Document) -> Vec<Option<String>> {
+    let mut entries: Vec<(i64, Dictionary)> = Vec::new();
+    if let Some(root) = doc
+        .catalog()
+        .ok()
+        .and_then(|catalog| catalog.get(b"PageLabels").ok())
+        .and_then(|labels| as_dictionary(doc, labels))
+    {
+        collect_labels(doc, root, &mut entries, 0);
+    }
+    entries.sort_by_key(|(index, _)| *index);
+    let total = doc.get_pages().len();
+    let mut labels = Vec::with_capacity(total);
+    for index in 0..total {
+        let index = index as i64;
+        let entry = entries
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= index)
+            .map(|(start, dict)| (*start, dict));
+        labels.push(match entry {
+            Some((start, dict)) => label_text(dict, index - start),
+            None => None,
+        });
+    }
+    labels
+}
+
+fn collect_labels(
+    doc: &Document,
+    dict: &Dictionary,
+    into: &mut Vec<(i64, Dictionary)>,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
+    if let Ok(nums) = dict.get(b"Nums").and_then(|nums| nums.as_array()) {
+        for pair in nums.chunks(2) {
+            if let [Object::Integer(index), Object::Dictionary(label)] = pair {
+                into.push((*index, label.clone()));
+            }
+        }
+    }
+    if let Ok(kids) = dict.get(b"Kids").and_then(|kids| kids.as_array()) {
+        for kid in kids {
+            if let Ok(kid) = kid.as_reference()
+                && let Ok(dict) = doc.get_dictionary(kid)
+            {
+                collect_labels(doc, dict, into, depth + 1);
+            }
+        }
+    }
+}
+
+fn label_text(label: &Dictionary, offset: i64) -> Option<String> {
+    let prefix = label
+        .get(b"P")
+        .ok()
+        .and_then(|prefix| prefix.as_str().ok())
+        .map(|prefix| String::from_utf8_lossy(prefix).into_owned())
+        .unwrap_or_default();
+    let start = label
+        .get(b"St")
+        .ok()
+        .and_then(|start| start.as_i64().ok())
+        .unwrap_or(1);
+    let number = start + offset;
+    let style = label.get(b"S").ok().and_then(|style| style.as_name().ok());
+    let body = match style {
+        None => return Some(prefix),
+        Some(b"D") => number.to_string(),
+        Some(b"R") => roman(number, true),
+        Some(b"r") => roman(number, false),
+        Some(b"A") => letters(number, true),
+        Some(b"a") => letters(number, false),
+        _ => return None,
+    };
+    Some(format!("{prefix}{body}"))
+}
+
+fn roman(number: i64, upper: bool) -> String {
+    if !(1..=3999).contains(&number) {
+        return number.to_string();
+    }
+    let table = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut left = number;
+    let mut text = String::new();
+    for (value, glyph) in table {
+        while left >= value {
+            text.push_str(glyph);
+            left -= value;
+        }
+    }
+    if upper { text.to_uppercase() } else { text }
+}
+
+fn letters(number: i64, upper: bool) -> String {
+    if number < 1 {
+        return number.to_string();
+    }
+    // A, B, ... Z, AA, AB, ... which is what a reader shows for this style.
+    let mut left = number;
+    let mut text = String::new();
+    while left > 0 {
+        let remainder = ((left - 1) % 26) as u8;
+        text.insert(0, (b'a' + remainder) as char);
+        left = (left - 1) / 26;
+    }
+    if upper { text.to_uppercase() } else { text }
+}
+
+/// Write labels as one entry per page: a label entry with a prefix and no style
+/// is exactly that text, which reproduces any numbering the input used without
+/// having to re-derive it.
+fn write_page_labels(out: &mut Document, labels: &[(u32, String)]) -> Option<ObjectId> {
+    if labels.is_empty() {
+        return None;
+    }
+    let mut nums: Vec<Object> = Vec::with_capacity(labels.len() * 2);
+    for (index, label) in labels {
+        nums.push(Object::Integer(*index as i64));
+        nums.push(Object::Dictionary(dictionary! {
+            "P" => Object::string_literal(label.clone()),
+        }));
+    }
+    let tree = out.add_object(dictionary! { "Nums" => nums });
+    Some(tree)
+}
+
+/// The embedded files of a document, as (name, file specification object).
+fn embedded_files(doc: &Document) -> Vec<(Vec<u8>, ObjectId)> {
+    let mut files = Vec::new();
+    let Some(tree) = doc
+        .catalog()
+        .ok()
+        .and_then(|catalog| catalog.get(b"Names").ok())
+        .and_then(|names| as_dictionary(doc, names))
+        .and_then(|names| names.get(b"EmbeddedFiles").ok())
+        .and_then(|files| as_dictionary(doc, files))
+    else {
+        return files;
+    };
+    collect_files(doc, tree, &mut files, 0);
+    files
+}
+
+/// A dictionary that may be written inline or behind a reference.
+fn as_dictionary<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Dictionary> {
+    match object {
+        Object::Dictionary(dict) => Some(dict),
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    }
+}
+
+fn collect_files(
+    doc: &Document,
+    dict: &Dictionary,
+    into: &mut Vec<(Vec<u8>, ObjectId)>,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
+    if let Ok(names) = dict.get(b"Names").and_then(|names| names.as_array()) {
+        for pair in names.chunks(2) {
+            if let [Object::String(name, _), Object::Reference(file)] = pair {
+                into.push((name.clone(), *file));
+            }
+        }
+    }
+    if let Ok(kids) = dict.get(b"Kids").and_then(|kids| kids.as_array()) {
+        for kid in kids {
+            if let Ok(kid) = kid.as_reference()
+                && let Ok(dict) = doc.get_dictionary(kid)
+            {
+                collect_files(doc, dict, into, depth + 1);
+            }
+        }
     }
 }
 

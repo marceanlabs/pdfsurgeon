@@ -131,7 +131,7 @@ trusting the writer:
 | A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
 
-`tests/edge_cases.rs` adds 59 more, against page trees written as raw bytes
+`tests/edge_cases.rs` adds 66 more, against page trees written as raw bytes
 because the shapes that break page surgery are the ones a library's own writer
 never produces: attributes inherited from a `Pages` node, a `/Parent` cycle, a
 `/Count` that lies, the same page object listed twice in `/Kids`, a zero page
@@ -233,6 +233,22 @@ whose entries all land inside those 40 pages.
   validation script names fields by full name, and a merge may have changed it.
   An XFA form is XML the viewer renders instead of the pages, so it is left
   behind rather than half carried.
+- **Signatures are dropped, not broken.** A signature covers the bytes of the
+  file it was made in, and page surgery changes them. The field and its widget
+  are removed rather than carried as a signature that fails the moment a reader
+  checks it. Everything else about the page is untouched.
+- **Page labels travel.** A file that numbers its front matter i, ii, iii and the
+  rest 1, 2, 3 keeps that numbering through a selection, a split and a merge;
+  the tree is written out one page at a time so the text is reproduced exactly
+  rather than re-derived.
+- **Attachments travel.** Embedded files are not page-bound, so they come with
+  the document. A merge that brings two files of the same name keeps both,
+  renaming the second `note (2).txt` rather than losing one.
+- **Accessibility tagging and layers do not travel.** A structure tree
+  (`/StructTreeRoot`) describes the document it was built for, and layer
+  membership lives in the content streams; rebuilding either is a different
+  program from this one. A tagged PDF comes out untagged and its layers come out
+  flat.
 - **Nothing is written in place.** The document is checked before it is written
   (its catalogue must own a page tree, every reference in it must land on an
   object, no stream may be missing its length), written to a temporary file

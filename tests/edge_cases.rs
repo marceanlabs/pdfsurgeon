@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use pdfsurgeon::lopdf::{Object, ObjectId, dictionary};
+use pdfsurgeon::lopdf::{Dictionary, Object, ObjectId, dictionary};
 use pdfsurgeon::{Document, Error, PageSpec, Piece};
 
 fn scratch(name: &str) -> PathBuf {
@@ -1918,6 +1918,262 @@ fn an_encrypted_file_is_opened_with_the_password_it_needs() {
     assert_eq!(doc.get_pages().len(), 1);
     let text = doc.extract_text(&[1]).unwrap();
     assert!(text.contains("fixture one"), "got {text:?}");
+}
+
+/// A page with a text field, a signature field and an attachment, and with
+/// page labels that switch from roman to decimal at page three.
+fn rich_document(path: &Path) {
+    let s1 = stream("one");
+    let s2 = stream("two");
+    let s3 = stream("three");
+    let s4 = stream("four");
+    let attachment = b"the attached file contents";
+    let mut file_stream = format!(
+        "<< /Type /EmbeddedFile /Subtype /text#2Fplain /Length {} >>\nstream\n",
+        attachment.len()
+    )
+    .into_bytes();
+    file_stream.extend_from_slice(attachment);
+    file_stream.extend_from_slice(b"\nendstream");
+
+    raw_pdf(
+        path,
+        &[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /AcroForm 20 0 R /PageLabels 25 0 R
+                  /Names << /EmbeddedFiles 30 0 R >> >>",
+            ),
+            (
+                2,
+                b"<< /Type /Pages /Count 4 /Kids [3 0 R 4 0 R 5 0 R 6 0 R]
+                  /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
+            ),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Annots [11 0 R 22 0 R] >>",
+            ),
+            (4, b"<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>"),
+            (5, b"<< /Type /Page /Parent 2 0 R /Contents 15 0 R >>"),
+            (6, b"<< /Type /Page /Parent 2 0 R /Contents 16 0 R >>"),
+            (7, &s1),
+            (8, &s2),
+            (15, &s3),
+            (16, &s4),
+            (
+                10,
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            ),
+            // A text field: dictionary is both field and widget.
+            (
+                11,
+                b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V () /F 4
+                   /Rect [72 700 250 720] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>",
+            ),
+            (20, b"<< /Fields [11 0 R 21 0 R] /DA (/Helv 0 Tf 0 g) >>"),
+            // A signature field with a value: the widget sits on page one too.
+            (
+                21,
+                b"<< /FT /Sig /T (approval) /V << /ByteRange [0 120 400 200]
+                   /Contents <00ff> /Filter /Adobe.PPKLite >> /Kids [22 0 R] >>",
+            ),
+            (
+                22,
+                b"<< /Type /Annot /Subtype /Widget /Parent 21 0 R /F 4
+                   /Rect [72 600 250 640] /P 3 0 R >>",
+            ),
+            // i, ii, then 1, 2.
+            (25, b"<< /Nums [0 << /S /r >> 2 << /S /D /St 1 >>] >>"),
+            (30, b"<< /Names [(readme.txt) 31 0 R] >>"),
+            (
+                31,
+                b"<< /Type /Filespec /F (readme.txt) /UF (readme.txt)
+                   /EF << /F 32 0 R >> >>",
+            ),
+            (32, &file_stream),
+        ],
+    );
+}
+
+fn form_field_ids(doc: &Document) -> Vec<ObjectId> {
+    let Some(form) = doc.catalog().ok().and_then(|c| c.get(b"AcroForm").ok()) else {
+        return Vec::new();
+    };
+    let form = match form {
+        Object::Reference(id) => doc.get_dictionary(*id).unwrap(),
+        Object::Dictionary(dict) => dict,
+        _ => return Vec::new(),
+    };
+    form.get(b"Fields")
+        .ok()
+        .and_then(|fields| fields.as_array().ok())
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| field.as_reference().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn resolve<'a>(object: &'a Object, doc: &'a Document) -> &'a Dictionary {
+    match object {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(id) => doc.get_dictionary(*id).unwrap(),
+        other => panic!("expected a dictionary, got {other:?}"),
+    }
+}
+
+fn labels_of(doc: &Document) -> Vec<String> {
+    let Some(tree) = doc
+        .catalog()
+        .ok()
+        .and_then(|catalog| catalog.get(b"PageLabels").ok())
+        .and_then(|labels| labels.as_reference().ok())
+    else {
+        return Vec::new();
+    };
+    let dict = doc.get_dictionary(tree).unwrap();
+    let nums = dict.get(b"Nums").unwrap().as_array().unwrap();
+    let mut labels = Vec::new();
+    for pair in nums.chunks(2) {
+        let index = pair[0].as_i64().unwrap();
+        let text = pair[1]
+            .as_dict()
+            .unwrap()
+            .get(b"P")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_vec();
+        labels.push(format!("{index}:{}", String::from_utf8_lossy(&text)));
+    }
+    labels
+}
+
+#[test]
+fn a_signature_field_does_not_survive_page_surgery() {
+    let dir = scratch("signature");
+    let file = dir.join("signed.pdf");
+    rich_document(&file);
+
+    let doc = Document::load(&file).unwrap();
+    assert_eq!(annots_of(&doc, 1).len(), 2, "fixture has two annotations");
+
+    let picked = pdfsurgeon::select(&doc, &[1]).unwrap();
+    assert_no_dangling_references(&picked);
+    assert_eq!(
+        form_field_ids(&picked).len(),
+        1,
+        "only the text field is left"
+    );
+    let field = picked.get_dictionary(form_field_ids(&picked)[0]).unwrap();
+    assert_eq!(field.get(b"T").unwrap().as_str().unwrap(), b"name");
+    assert_eq!(
+        annots_of(&picked, 1).len(),
+        1,
+        "the signature widget has to leave the page with its field"
+    );
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&file).unwrap(),
+        Document::load(&file).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+    let kinds: Vec<Vec<u8>> = form_field_ids(&merged)
+        .iter()
+        .filter_map(|id| {
+            merged
+                .get_dictionary(*id)
+                .ok()
+                .and_then(|dict| dict.get(b"FT").ok())
+                .and_then(|kind| kind.as_name().ok())
+                .map(<[u8]>::to_vec)
+        })
+        .collect();
+    assert!(
+        !kinds.iter().any(|kind| kind == b"Sig"),
+        "no signature fields"
+    );
+    assert_eq!(annots_of(&merged, 1).len(), 1);
+}
+
+#[test]
+fn page_labels_are_carried_and_keep_their_text() {
+    let dir = scratch("labels");
+    let file = dir.join("labelled.pdf");
+    rich_document(&file);
+
+    let doc = Document::load(&file).unwrap();
+    // Page two is "ii" in the input.
+    let second = pdfsurgeon::select(&doc, &[2]).unwrap();
+    assert_eq!(labels_of(&second), vec!["0:ii"]);
+
+    // Page three starts the decimal run again: it is "1" there, and it is the
+    // first page of the output.
+    let third = pdfsurgeon::select(&doc, &[3]).unwrap();
+    assert_eq!(labels_of(&third), vec!["0:1"]);
+
+    let both = pdfsurgeon::select(&doc, &[1, 2, 3]).unwrap();
+    assert_eq!(labels_of(&both), vec!["0:i", "1:ii", "2:1"]);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&file).unwrap(),
+        Document::load(&file).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        labels_of(&merged),
+        vec!["0:i", "1:ii", "2:1", "3:2", "4:i", "5:ii", "6:1", "7:2"]
+    );
+}
+
+#[test]
+fn attachments_travel_with_the_document() {
+    let dir = scratch("attachments");
+    let file = dir.join("attached.pdf");
+    rich_document(&file);
+
+    let doc = Document::load(&file).unwrap();
+    let picked = pdfsurgeon::select(&doc, &[1]).unwrap();
+    assert_no_dangling_references(&picked);
+    let names = resolve(picked.catalog().unwrap().get(b"Names").unwrap(), &picked);
+    let tree = names.get(b"EmbeddedFiles").unwrap().as_reference().unwrap();
+    let tree = picked.get_dictionary(tree).unwrap();
+    let pairs = tree.get(b"Names").unwrap().as_array().unwrap();
+    assert_eq!(pairs[0].as_str().unwrap(), b"readme.txt");
+    let filespec = pairs[1].as_reference().unwrap();
+    let embedded = picked
+        .get_dictionary(filespec)
+        .unwrap()
+        .get(b"EF")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"F")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    match picked.get_object(embedded).unwrap() {
+        Object::Stream(stream) => assert_eq!(stream.content, b"the attached file contents"),
+        other => panic!("expected the embedded stream, got {other:?}"),
+    }
+
+    // Two documents with an attachment of the same name keep both files.
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&file).unwrap(),
+        Document::load(&file).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+    let names = resolve(merged.catalog().unwrap().get(b"Names").unwrap(), &merged);
+    let tree = names.get(b"EmbeddedFiles").unwrap().as_reference().unwrap();
+    let tree = merged.get_dictionary(tree).unwrap();
+    let pairs = tree.get(b"Names").unwrap().as_array().unwrap();
+    assert_eq!(pairs.len(), 4, "two attachments, one name entry each");
+    assert_eq!(pairs[0].as_str().unwrap(), b"readme.txt");
+    assert_eq!(pairs[2].as_str().unwrap(), b"readme (2).txt");
 }
 
 // ---------------------------------------------------------------------------

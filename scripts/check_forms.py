@@ -110,6 +110,26 @@ with tempfile.TemporaryDirectory() as work:
     check(set(fields(assembled)) == {"name", "name_2", "agree", "agree_2"},
           f"assemble kept the wrong fields: {sorted(fields(assembled))}")
 
+    # Attachments are not page-bound: they travel with the document, and two
+    # inputs that attach the same name keep both files.
+    attached = work / "attached.pdf"
+    writer = PdfWriter()
+    writer.append(PdfReader(str(a)))
+    writer.add_attachment("note.txt", b"attached note")
+    writer.write(str(attached))
+    check(bool(PdfReader(str(attached)).attachments), "fixture should carry an attachment")
+
+    picked_attached = work / "picked-attached.pdf"
+    run("select", attached, "--pages", "1", "-o", picked_attached)
+    kept = PdfReader(str(picked_attached)).attachments
+    check(list(kept) == ["note.txt"], f"select lost the attachment: {list(kept)}")
+    check(kept["note.txt"][0] == b"attached note", "the attachment content changed")
+
+    merged_attached = work / "merged-attached.pdf"
+    run("merge", "-o", merged_attached, attached, attached)
+    names = sorted(PdfReader(str(merged_attached)).attachments)
+    check(names == ["note (2).txt", "note.txt"], f"merge renamed oddly: {names}")
+
     # The form has to point its widgets at the pages they now sit on.
     reader = PdfReader(str(merged))
     page_ids = {page.indirect_reference.idnum: number for number, page in enumerate(reader.pages, 1)}
