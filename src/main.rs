@@ -32,6 +32,10 @@ Angles are multiples of 90 and are added to any rotation a page already has.
 
 Flags may come before or after the files. `--` ends flag parsing, so a file
 whose name starts with a dash can still be named.
+
+An encrypted input is opened with `--password`: without one the empty password
+is tried, which is all a file with only an owner password needs. The output is
+never encrypted.
 ";
 
 fn main() {
@@ -63,44 +67,45 @@ fn run() -> Res<()> {
             let parsed = parse_args(&args[1..])?;
             one_file(&parsed)?;
             let file = parsed.positional.first().ok_or("info needs a file")?;
-            cmd_info(Path::new(file))
+            cmd_info(Path::new(file), &parsed)
         }
         "merge" => {
             let args = parse_args(&args[1..])?;
-            let out = args.out.ok_or("merge needs -o <out.pdf>")?;
-            cmd_merge(&args.positional, &out)
+            let out = args.out.clone().ok_or("merge needs -o <out.pdf>")?;
+            cmd_merge(&args.positional, &out, &args)
         }
         "assemble" => {
             let args = parse_args(&args[1..])?;
-            let out = args.out.ok_or("assemble needs -o <out.pdf>")?;
-            cmd_assemble(&args.positional, &out)
+            let out = args.out.clone().ok_or("assemble needs -o <out.pdf>")?;
+            cmd_assemble(&args.positional, &out, &args)
         }
         "split" => {
             let args = parse_args(&args[1..])?;
             one_file(&args)?;
             let file = args.positional.first().ok_or("split needs a file")?;
-            cmd_split(Path::new(file), args.out)
+            cmd_split(Path::new(file), args.out.clone(), &args)
         }
         "select" => {
             let args = parse_args(&args[1..])?;
             one_file(&args)?;
-            let out = args.out.ok_or("select needs -o <out.pdf>")?;
+            let out = args.out.clone().ok_or("select needs -o <out.pdf>")?;
             let file = args.positional.first().ok_or("select needs a file")?;
-            let spec = args.pages.ok_or("select needs --pages")?;
-            cmd_select(Path::new(file), &spec, &out)
+            let spec = args.pages.clone().ok_or("select needs --pages")?;
+            cmd_select(Path::new(file), &spec, &out, &args)
         }
         "rotate" => {
             let args = parse_args(&args[1..])?;
             one_file(&args)?;
-            let out = args.out.ok_or("rotate needs -o <out.pdf>")?;
+            let out = args.out.clone().ok_or("rotate needs -o <out.pdf>")?;
             let file = args.positional.first().ok_or("rotate needs a file")?;
-            let spec = args.pages.ok_or("rotate needs --pages")?;
+            let spec = args.pages.clone().ok_or("rotate needs --pages")?;
             let angle: i64 = args
                 .angle
+                .clone()
                 .ok_or("rotate needs --angle")?
                 .parse()
                 .map_err(|_| "angle must be a whole number of degrees")?;
-            cmd_rotate(Path::new(file), &spec, angle, &out)
+            cmd_rotate(Path::new(file), &spec, angle, &out, &args)
         }
         other => Err(format!("unknown command `{other}`\n\n{USAGE}").into()),
     }
@@ -111,6 +116,10 @@ struct Parsed {
     out: Option<PathBuf>,
     pages: Option<String>,
     angle: Option<String>,
+    /// Password for an encrypted input. Empty by default, which opens the
+    /// common case of a file that only carries an owner password.
+    password: Option<String>,
+    compress: bool,
     positional: Vec<OsString>,
 }
 
@@ -144,6 +153,15 @@ fn parse_args(args: &[OsString]) -> Res<Parsed> {
                 parsed.angle = Some(spec_text(value.clone())?);
                 i += 2;
             }
+            Some("--password") => {
+                let value = args.get(i + 1).ok_or("--password needs a value")?;
+                parsed.password = Some(value.to_string_lossy().into_owned());
+                i += 2;
+            }
+            Some("--compress") => {
+                parsed.compress = true;
+                i += 1;
+            }
             _ => {
                 parsed.positional.push(arg.clone());
                 i += 1;
@@ -172,28 +190,52 @@ fn spec_text(value: OsString) -> Res<String> {
 
 /// Load with the path in the message: "IO error" on its own does not say which
 /// file was missing.
-fn load(path: &Path) -> Res<Document> {
+fn load(path: &Path, password: Option<&str>) -> Res<Document> {
     if path.is_dir() {
         return Err(format!("{}: is a directory", path.display()).into());
     }
-    Document::load(path).map_err(|err| format!("{}: {err}", path.display()).into())
+    let doc = match password {
+        Some(password) => Document::load_with_password(path, password),
+        None => Document::load(path),
+    }
+    .map_err(|err| format!("{}: {err}", path.display()))?;
+    // A file whose password is not known still parses: it reports that it is
+    // encrypted and yields an empty page tree, which is the failure mode that
+    // must not reach a caller.
+    if doc.is_encrypted() {
+        return Err(format!(
+            "{}: this document is encrypted; pass --password with the password it wants",
+            path.display()
+        )
+        .into());
+    }
+    Ok(doc)
 }
 
 /// Everything that rewrites pages needs a document it can actually read. An
 /// encrypted file parses far enough to report itself and then yields an empty
-/// page tree, which is worse than an error.
-fn load_plain(path: &Path) -> Res<Document> {
-    let doc = load(path)?;
-    if doc.is_encrypted() {
-        return Err(format!("{}: encrypted PDFs are not supported", path.display()).into());
-    }
-    Ok(doc)
+/// page tree, so it is decrypted here or it is an error.
+///
+/// The empty password is tried when none is given: a file that only carries an
+/// owner password opens with it, which is the usual case for a document that
+/// was "protected" to stop editing rather than to stop reading.
+fn load_plain(path: &Path, password: Option<&str>) -> Res<Document> {
+    load(path, password)
 }
 
 /// Write through a temporary file in the same directory and rename it into
 /// place, so a failed write cannot leave a half written document, and writing
 /// over the input file cannot destroy it.
-fn save(doc: &mut Document, out: &Path) -> Res<()> {
+fn save(doc: &mut Document, out: &Path, compress: bool) -> Res<()> {
+    if compress {
+        // Only streams that carry no filter are touched: an image or an already
+        // compressed stream is left exactly as it is.
+        for object in doc.objects.values_mut() {
+            if let pdfsurgeon::lopdf::Object::Stream(stream) = object {
+                let _ = stream.compress();
+            }
+        }
+    }
     if let Err(err) = verify(doc) {
         return Err(format!("{}: {err}; nothing was written", out.display()).into());
     }
@@ -258,33 +300,43 @@ fn temp_path(out: &Path) -> PathBuf {
     out.with_file_name(format!(".{name}.{}.part", std::process::id()))
 }
 
-fn cmd_info(path: &Path) -> Res<()> {
-    let doc = load(path)?;
+fn cmd_info(path: &Path, args: &Parsed) -> Res<()> {
+    let doc = load(path, args.password.as_deref())?;
+    // `was_encrypted` is the honest answer once it is open: the input carried
+    // encryption, and the output will not.
+    let was = doc.was_encrypted();
     let info = pdfsurgeon::info(&doc);
     println!("file:      {}", path.display());
     println!("version:   {}", info.version);
     println!("pages:     {}", info.pages);
-    println!("encrypted: {}", info.encrypted);
+    println!(
+        "encrypted: {}",
+        if was {
+            "yes (opened; the output would not be)"
+        } else {
+            "no"
+        }
+    );
     if let Some((width, height)) = info.page_size {
         println!("page size: {width:.0} x {height:.0} pt");
     }
     Ok(())
 }
 
-fn cmd_merge(inputs: &[OsString], out: &Path) -> Res<()> {
+fn cmd_merge(inputs: &[OsString], out: &Path, args: &Parsed) -> Res<()> {
     if inputs.is_empty() {
         return Err("merge needs at least one input file".into());
     }
     let mut docs = Vec::with_capacity(inputs.len());
     for input in inputs {
-        docs.push(load_plain(Path::new(input))?);
+        docs.push(load_plain(Path::new(input), args.password.as_deref())?);
     }
     let mut merged = pdfsurgeon::merge(docs)?;
-    save(&mut merged, out)
+    save(&mut merged, out, args.compress)
 }
 
 /// Split `file[:pages]` pieces into documents, then assemble them in order.
-fn cmd_assemble(inputs: &[OsString], out: &Path) -> Res<()> {
+fn cmd_assemble(inputs: &[OsString], out: &Path, args: &Parsed) -> Res<()> {
     if inputs.is_empty() {
         return Err("assemble needs at least one input file".into());
     }
@@ -293,7 +345,7 @@ fn cmd_assemble(inputs: &[OsString], out: &Path) -> Res<()> {
 
     for input in inputs {
         let (path, spec) = split_piece(input);
-        let doc = load_plain(&path)?;
+        let doc = load_plain(&path, args.password.as_deref())?;
         let total = doc.get_pages().len() as u32;
         let pages = match spec {
             Some(spec) => PageSpec::parse(&spec, total)?.pages().to_vec(),
@@ -307,7 +359,7 @@ fn cmd_assemble(inputs: &[OsString], out: &Path) -> Res<()> {
     }
 
     let mut doc = pdfsurgeon::assemble(&sources, &pieces)?;
-    save(&mut doc, out)
+    save(&mut doc, out, args.compress)
 }
 
 /// `report.pdf:1-3` is a path and a page spec. `C:\report.pdf` and
@@ -332,8 +384,8 @@ fn looks_like_spec(text: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c == ',' || c == '-' || c == ' ')
 }
 
-fn cmd_split(path: &Path, out_dir: Option<PathBuf>) -> Res<()> {
-    let source = load_plain(path)?;
+fn cmd_split(path: &Path, out_dir: Option<PathBuf>, args: &Parsed) -> Res<()> {
+    let source = load_plain(path, args.password.as_deref())?;
     let total = source.get_pages().len() as u32;
     let dir = out_dir.unwrap_or_else(|| {
         path.parent()
@@ -355,25 +407,25 @@ fn cmd_split(path: &Path, out_dir: Option<PathBuf>) -> Res<()> {
     for (index, mut single) in pdfsurgeon::split(&source)?.into_iter().enumerate() {
         let page = index as u32 + 1;
         let name = format!("{stem}-{page:0width$}.pdf");
-        save(&mut single, &dir.join(name))?;
+        save(&mut single, &dir.join(name), args.compress)?;
     }
     Ok(())
 }
 
-fn cmd_select(path: &Path, spec: &str, out: &Path) -> Res<()> {
-    let source = load_plain(path)?;
+fn cmd_select(path: &Path, spec: &str, out: &Path, args: &Parsed) -> Res<()> {
+    let source = load_plain(path, args.password.as_deref())?;
     let total = source.get_pages().len() as u32;
     let keep = PageSpec::parse(spec, total)?;
     let mut doc = pdfsurgeon::select(&source, keep.pages())?;
-    save(&mut doc, out)
+    save(&mut doc, out, args.compress)
 }
 
-fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path) -> Res<()> {
-    let mut doc = load_plain(path)?;
+fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path, args: &Parsed) -> Res<()> {
+    let mut doc = load_plain(path, args.password.as_deref())?;
     let total = doc.get_pages().len() as u32;
     let pages = PageSpec::parse(spec, total)?;
     pdfsurgeon::rotate(&mut doc, pages.pages(), angle)?;
-    save(&mut doc, out)
+    save(&mut doc, out, args.compress)
 }
 
 #[cfg(test)]

@@ -70,6 +70,27 @@ for input in "$@"; do
 
   echo "  parts: $(find "$work/$name-parts" -name '*.pdf' | wc -l) files, warnings checked"
 
+  # An encrypted copy of the same file, made by qpdf, has to open with the
+  # empty password and read back the same text.
+  if command -v qpdf >/dev/null && command -v pdftotext >/dev/null; then
+    qpdf --encrypt '' '' 256 -- "$input" "$work/$name-locked.pdf"
+    "$binary" select "$work/$name-locked.pdf" --pages 1 -o "$work/$name-locked-pick.pdf"
+    pdftotext "$work/$name-locked-pick.pdf" "$work/locked.txt"
+    pdftotext -f 1 -l 1 "$input" "$work/plain.txt"
+    if diff -q "$work/locked.txt" "$work/plain.txt" >/dev/null; then
+      echo "  encrypted copy: opens, page one reads the same"
+    else
+      echo "  FAIL  encrypted copy: page one reads differently"
+      status=1
+    fi
+    if pdfinfo "$work/$name-locked-pick.pdf" | grep -q '^Encrypted:.*no'; then
+      echo "  encrypted copy: the output is not encrypted"
+    else
+      echo "  FAIL  encrypted copy: the output is still encrypted"
+      status=1
+    fi
+  fi
+
   # A page spec the command has to expand, with a reference built by qpdf
   # rather than by us: the text of the selection must match the text of the
   # same pages in the reference document.

@@ -60,6 +60,9 @@ pdfsurgeon select <file> --pages <spec> -o <out.pdf>
 pdfsurgeon rotate <file> --pages <spec> --angle <deg> -o <out.pdf>
 ```
 
+`--password <pw>` opens an encrypted input, `--compress` squeezes streams that
+carry no filter, and both work on every command that reads a file.
+
 Split names its files `<name>-<page>.pdf` with at least three digits, and more
 when the page count needs them, so they sort beside the original.
 
@@ -199,8 +202,12 @@ whose entries all land inside those 40 pages.
 
 ## What it deliberately does not do
 
-- **No decryption.** `info` reports an encrypted file; every command that would
-  rewrite it refuses instead of writing a document whose streams it cannot read.
+- **Encryption is read, never written.** An encrypted input is opened with
+  `--password`; without one the empty password is tried, which is all a document
+  with an owner password needs. The output is always unencrypted, and the
+  permissions it carried (no printing, no copying) go with the encryption. A
+  file whose password is not known is refused with the flag named, because the
+  alternative is a document that parses and then yields an empty page tree.
 - **No repair.** Damaged files that lopdf cannot parse are refused, and so are
   damaged files that parse only by guesswork: a stream whose `/Length` is
   missing or does not match the bytes that were read would be copied without
@@ -210,7 +217,10 @@ whose entries all land inside those 40 pages.
   a merge and through an extraction, and its `/OpenAction` and `/PageMode` are
   kept when the page they name survives. An `/Info` that holds a reference is
   left behind rather than copied with a pointer into a document that no longer
-  exists. The XMP `/Metadata` stream and JavaScript do not travel.
+  exists. The XMP `/Metadata` packet travels the same way when there is one
+  input, including a merge of one; a merge of several drops it, because a packet
+  describing one file would be a false statement about the result. JavaScript
+  does not travel at all.
 - **Forms travel as forms, not as pictures.** `merge`, `assemble`, `select` and
   `split` all rebuild `/AcroForm` around the widgets that are actually in the
   output. Fields keep their type, flags, values and appearance streams; a field
@@ -229,8 +239,10 @@ whose entries all land inside those 40 pages.
   beside the destination, and renamed into place. A failed write cannot leave
   half a document, `-o` may name the input file, and a document that would not
   open is never left behind.
-- **No recompression or font work.** Streams are carried over; the output keeps
-  the size of the input apart from the removed pages.
+- **No font work, and compression is opt-in.** Streams are carried over as they
+  are, so the output keeps the size of the input apart from the removed pages.
+  `--compress` flate-compresses streams that carry no filter at all; images and
+  streams that are already compressed are left alone.
 - **Links into removed pages are dropped.** A file whose links pointed at page 12
   will lose those links if page 12 is gone; keeping them would keep the warnings.
 - **Bookmarks are pruned, not invented.** A merge splices every input's outline

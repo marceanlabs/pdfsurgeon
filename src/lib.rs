@@ -563,6 +563,7 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     }
     // The document level bits worth carrying from the first input: its
     // metadata, and the view it asked a reader to open in.
+    let single_input = sources.len() == 1;
     let first_info = sources[0].trailer.get(b"Info").ok().cloned();
     let first_catalog = sources[0].catalog().ok().cloned();
     let first_open_action = first_catalog
@@ -704,6 +705,14 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     }
     if let Some(action) = first_open_action {
         catalog.set("OpenAction", action);
+    }
+    if single_input
+        && let Some(metadata) = first_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.get(b"Metadata").ok())
+        && metadata.as_reference().is_ok()
+    {
+        catalog.set("Metadata", metadata.clone());
     }
     if let Some(acroform) = merge_forms(&mut out, &forms) {
         catalog.set("AcroForm", acroform);
@@ -961,12 +970,23 @@ fn extract_with_names(
         None
     };
     let acroform = build_extracted_form(sources, &mut out, &map, keys);
+    // XMP describes the document it came from. Extracting pages from one file
+    // keeps the description true enough; a merge of several would make it a
+    // statement about a document that never existed.
+    let metadata = if sources.len() == 1 {
+        copy_metadata(&sources[0], &mut out)
+    } else {
+        None
+    };
     let mut catalog = dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
     };
     if let Some(acroform) = acroform {
         catalog.set("AcroForm", acroform);
+    }
+    if let Some(metadata) = metadata {
+        catalog.set("Metadata", metadata);
     }
     if let Some(outlines_id) = outlines {
         catalog.set("Outlines", outlines_id);
@@ -1895,6 +1915,28 @@ fn build_extracted_form(
         }
     }
     Some(out.add_object(acroform))
+}
+
+/// Copy the XMP packet of `source` across. It is a stream of text with no
+/// pointers of its own, so it can be moved as it stands; one that does hold a
+/// reference is left behind rather than copied with a dead pointer.
+fn copy_metadata(source: &Document, out: &mut Document) -> Option<ObjectId> {
+    let id = source
+        .catalog()
+        .ok()?
+        .get(b"Metadata")
+        .ok()?
+        .as_reference()
+        .ok()?;
+    let Ok(Object::Stream(stream)) = source.get_object(id) else {
+        return None;
+    };
+    if stream.dict.iter().any(|(_, value)| has_reference(value)) {
+        return None;
+    }
+    let mut stream = stream.clone();
+    stream.dict.set("Length", stream.content.len() as i64);
+    Some(out.add_object(stream))
 }
 
 fn acroform_dict(source: &Document) -> Option<Dictionary> {

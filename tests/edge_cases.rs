@@ -1711,6 +1711,215 @@ fn select_keeps_the_fields_on_the_pages_it_kept() {
     assert_eq!(pages, 1);
 }
 
+/// One page, an uncompressed content stream, and an XMP packet.
+fn xmp_document(path: &Path) {
+    let s = stream("with metadata");
+    let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><title>Report</title></x:xmpmeta>";
+    let mut packet = format!(
+        "<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
+        xmp.len()
+    )
+    .into_bytes();
+    packet.extend_from_slice(xmp);
+    packet.extend_from_slice(b"\nendstream");
+    raw_pdf(
+        path,
+        &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 10 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Count 1 /Kids [3 0 R] /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>"),
+            (5, &s),
+            (10, &packet),
+        ],
+    );
+}
+
+#[test]
+fn extraction_keeps_the_xmp_packet_of_its_one_input() {
+    let dir = scratch("xmp-extract");
+    let file = dir.join("xmp.pdf");
+    xmp_document(&file);
+
+    let doc = Document::load(&file).unwrap();
+    let picked = pdfsurgeon::select(&doc, &[1]).unwrap();
+    assert_no_dangling_references(&picked);
+    let metadata = picked
+        .catalog()
+        .unwrap()
+        .get(b"Metadata")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let stream = match picked.get_object(metadata).unwrap() {
+        Object::Stream(stream) => stream,
+        other => panic!("expected a stream, got {other:?}"),
+    };
+    assert!(
+        String::from_utf8_lossy(&stream.content).contains("<title>Report</title>"),
+        "the packet should be carried as it was"
+    );
+}
+
+#[test]
+fn a_merge_of_several_inputs_does_not_claim_one_files_xmp() {
+    let dir = scratch("xmp-merge");
+    let a = dir.join("a.pdf");
+    let b = dir.join("b.pdf");
+    xmp_document(&a);
+    linked_document(&b);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&a).unwrap(),
+        Document::load(&b).unwrap(),
+    ])
+    .unwrap();
+    assert!(
+        merged.catalog().unwrap().get(b"Metadata").is_err(),
+        "a packet describing one input would lie about the merged document"
+    );
+
+    // One input is still one document, so its packet can stay.
+    let single = pdfsurgeon::merge(vec![Document::load(&a).unwrap()]).unwrap();
+    assert!(single.catalog().unwrap().get(b"Metadata").is_ok());
+}
+
+/// One page whose content stream is long enough that compressing it wins.
+fn padded_document(path: &Path) {
+    let body = format!(
+        "BT /F1 18 Tf 72 720 Td ({}) Tj ET\n",
+        "compression should make this stream smaller ".repeat(40)
+    )
+    .into_bytes();
+    let mut s = format!("<< /Length {} >>\nstream\n", body.len()).into_bytes();
+    s.extend_from_slice(&body);
+    s.extend_from_slice(b"\nendstream");
+    raw_pdf(
+        path,
+        &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Count 1 /Kids [3 0 R] /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>"),
+            (5, &s),
+        ],
+    );
+}
+
+#[test]
+fn compress_flattens_uncompressed_streams_and_keeps_their_content() {
+    let dir = scratch("compress");
+    let file = dir.join("plain.pdf");
+    padded_document(&file);
+    let out = dir.join("compressed.pdf");
+
+    let status = cli(&[
+        "select",
+        file.to_str().unwrap(),
+        "--pages",
+        "1",
+        "--compress",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(status.status.success(), "{}", stderr(&status));
+
+    let doc = Document::load(&out).unwrap();
+    assert_no_dangling_references(&doc);
+    let page = doc.get_pages()[&1];
+    let contents = doc
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Contents")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let stream = match doc.get_object(contents).unwrap() {
+        Object::Stream(stream) => stream,
+        other => panic!("expected a stream, got {other:?}"),
+    };
+    assert_eq!(
+        stream.dict.get(b"Filter").unwrap().as_name().unwrap(),
+        b"FlateDecode"
+    );
+    assert!(
+        String::from_utf8_lossy(&stream.decompressed_content().unwrap())
+            .contains("compression should make this stream smaller"),
+        "compressing must not change what the stream says"
+    );
+    let plain_size = fs::metadata(&file).unwrap().len();
+    let compressed_size = fs::metadata(&out).unwrap().len();
+    assert!(
+        compressed_size < plain_size,
+        "expected a smaller file: {compressed_size} vs {plain_size}"
+    );
+}
+
+#[test]
+fn an_encrypted_file_is_opened_with_the_password_it_needs() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let locked = fixtures.join("locked-secret.pdf");
+    let open = fixtures.join("locked-empty.pdf");
+    let dir = scratch("encrypted-cli");
+
+    // The owner-password-only file opens with no help.
+    let out = dir.join("empty.pdf");
+    let status = cli(&[
+        "select",
+        open.to_str().unwrap(),
+        "--pages",
+        "1",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let doc = Document::load(&out).unwrap();
+    assert!(!doc.was_encrypted(), "the output should not be encrypted");
+
+    // The one with a real password says so, and takes it when given.
+    let refused = dir.join("refused.pdf");
+    let status = cli(&[
+        "select",
+        locked.to_str().unwrap(),
+        "--pages",
+        "1",
+        "-o",
+        refused.to_str().unwrap(),
+    ]);
+    assert!(!status.status.success());
+    assert!(
+        stderr(&status).contains("--password"),
+        "the error should name the flag: {}",
+        stderr(&status)
+    );
+    assert!(
+        !refused.exists(),
+        "nothing should be written without the password"
+    );
+
+    let opened = dir.join("opened.pdf");
+    let status = cli(&[
+        "select",
+        locked.to_str().unwrap(),
+        "--pages",
+        "1",
+        "--password",
+        "secret",
+        "-o",
+        opened.to_str().unwrap(),
+    ]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let doc = Document::load(&opened).unwrap();
+    assert!(!doc.was_encrypted());
+    assert_eq!(doc.get_pages().len(), 1);
+    let text = doc.extract_text(&[1]).unwrap();
+    assert!(text.contains("fixture one"), "got {text:?}");
+}
+
 // ---------------------------------------------------------------------------
 // command line behaviour
 // ---------------------------------------------------------------------------
