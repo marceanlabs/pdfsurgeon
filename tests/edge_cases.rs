@@ -1204,7 +1204,8 @@ fn the_help_text_and_a_bare_invocation_succeed() {
 fn mutated_documents_fail_cleanly_and_never_crash() {
     // Both shapes: a plain nested tree, and one carrying links, a name tree and
     // an outline, so the destination and bookmark code is fuzzed too.
-    let fixtures: [(&str, fn(&Path)); 2] = [("nested", nested_tree), ("linked", linked_document)];
+    type Fixture = (&'static str, fn(&Path));
+    let fixtures: [Fixture; 2] = [("nested", nested_tree), ("linked", linked_document)];
     let dir = scratch("fuzz");
     let mut state: u64 = 0x5eed;
     let mut next = || {
