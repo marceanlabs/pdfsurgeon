@@ -163,6 +163,162 @@ fn stream_length(doc: &Document, stream: &lopdf::Stream) -> Option<i64> {
     }
 }
 
+/// Follow a reference one step; anything else is its own value.
+fn follow<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Object> {
+    match object {
+        Object::Reference(id) => doc.get_object(*id).ok(),
+        other => Some(other),
+    }
+}
+
+/// Every named destination the document defines, name to destination.
+///
+/// The name tree under `/Names /Dests` is the current form; `/Dests` on the
+/// catalogue is the older one. Both are read, because files from the last
+/// twenty years contain both.
+fn named_destinations(doc: &Document) -> BTreeMap<Vec<u8>, Object> {
+    let mut names = BTreeMap::new();
+    let Ok(catalog) = doc.catalog() else {
+        return names;
+    };
+    if let Ok(tree) = catalog.get(b"Names")
+        && let Some(dict) = follow(doc, tree).and_then(|node| node.as_dict().ok())
+        && let Ok(dests) = dict.get(b"Dests")
+    {
+        collect_name_tree(doc, dests, &mut names, 0);
+    }
+    if let Ok(dests) = catalog.get(b"Dests")
+        && let Some(dict) = follow(doc, dests).and_then(|node| node.as_dict().ok())
+    {
+        for (name, value) in dict.iter() {
+            names
+                .entry(name.clone())
+                .or_insert_with(|| unwrap_reference(doc, value, 0));
+        }
+    }
+    names
+}
+
+fn collect_name_tree(
+    doc: &Document,
+    node: &Object,
+    names: &mut BTreeMap<Vec<u8>, Object>,
+    depth: usize,
+) {
+    // A name tree can nest; a damaged one can nest forever.
+    if depth > 32 {
+        return;
+    }
+    let Some(dict) = follow(doc, node).and_then(|node| node.as_dict().ok()) else {
+        return;
+    };
+    if let Ok(entries) = dict.get(b"Names")
+        && let Ok(entries) = entries.as_array()
+    {
+        for pair in entries.chunks(2) {
+            if let [key, value] = pair
+                && let Ok(name) = key.as_str()
+            {
+                names.insert(name.to_vec(), unwrap_reference(doc, value, 0));
+            }
+        }
+    }
+    if let Ok(kids) = dict.get(b"Kids")
+        && let Ok(kids) = kids.as_array()
+    {
+        for kid in kids {
+            collect_name_tree(doc, kid, names, depth + 1);
+        }
+    }
+}
+
+/// Follow a chain of references to the object it lands on.
+fn unwrap_reference(doc: &Document, value: &Object, depth: usize) -> Object {
+    match value {
+        Object::Reference(id) if depth < 8 => match doc.get_object(*id) {
+            Ok(inner) => unwrap_reference(doc, inner, depth + 1),
+            Err(_) => value.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// A destination as an explicit array of page reference plus view, following
+/// names until it reaches one. `None` means the name is not defined here.
+fn resolve_destination(
+    value: &Object,
+    names: &BTreeMap<Vec<u8>, Object>,
+    depth: usize,
+) -> Option<Object> {
+    if depth > 8 {
+        return None;
+    }
+    match value {
+        Object::Array(_) => Some(value.clone()),
+        Object::Dictionary(_) => {
+            let inner = value.as_dict().ok()?.get(b"D").ok()?;
+            resolve_destination(inner, names, depth + 1)
+        }
+        Object::String(..) | Object::Name(..) => {
+            let key = value.as_str().ok()?.to_vec();
+            resolve_destination(names.get(&key)?, names, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn target_is_kept(destination: &Object, kept: Option<&BTreeSet<ObjectId>>) -> bool {
+    let Some(kept) = kept else {
+        return true;
+    };
+    let Ok(items) = destination.as_array() else {
+        return false;
+    };
+    match items.first() {
+        Some(Object::Reference(id)) => kept.contains(id),
+        _ => false,
+    }
+}
+
+/// Point a link at the page it names instead of at a name.
+///
+/// A name tree lives in the catalogue, and a rebuilt catalogue does not carry
+/// one, so a `/A << /S /GoTo /D (section.2) >>` would otherwise point at
+/// nothing. When the page it names is not part of the output, the destination
+/// is dropped rather than left dangling: the link stops working, which is what
+/// the document says, instead of opening somewhere arbitrary.
+fn resolve_links(
+    object: &mut Object,
+    names: &BTreeMap<Vec<u8>, Object>,
+    kept: Option<&BTreeSet<ObjectId>>,
+) {
+    let Object::Dictionary(dict) = object else {
+        return;
+    };
+    if let Ok(destination) = dict.get(b"Dest").cloned() {
+        match resolve_destination(&destination, names, 0)
+            .filter(|array| target_is_kept(array, kept))
+        {
+            Some(array) => dict.set("Dest", array),
+            None => {
+                dict.remove(b"Dest");
+            }
+        }
+    }
+    let goto = dict.get(b"S").ok().and_then(|kind| kind.as_name().ok()) == Some(b"GoTo");
+    if goto && let Ok(destination) = dict.get(b"D").cloned() {
+        match resolve_destination(&destination, names, 0)
+            .filter(|array| target_is_kept(array, kept))
+        {
+            Some(array) => dict.set("D", array),
+            None => {
+                dict.remove(b"D");
+                dict.remove(b"S");
+            }
+        }
+    }
+}
+
 /// A page box number, whether the producer wrote it as an integer or a real.
 fn as_number(object: &Object) -> Option<f32> {
     match object {
@@ -384,6 +540,8 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
     let mut out = Document::with_version(sources[0].version.clone());
     let mut offset: u32 = 0;
     let mut page_ids: Vec<ObjectId> = Vec::new();
+    // Top level chains of each source outline, in output ids.
+    let mut outlines: Vec<(ObjectId, i64)> = Vec::new();
 
     for doc in sources {
         let by_number = doc.get_pages();
@@ -403,6 +561,25 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
         }
         let span = span as u32;
         page_ids.extend(by_number.values().map(|(n, g)| (n + offset, *g)));
+
+        let names = named_destinations(&doc);
+        if let Some(dict) = doc
+            .catalog()
+            .ok()
+            .and_then(|catalog| catalog.get(b"Outlines").ok())
+            .and_then(|outlines| outlines.as_reference().ok())
+            .and_then(|id| doc.get_dictionary(id).ok())
+        {
+            let first = dict.get(b"First").ok().and_then(|o| o.as_reference().ok());
+            let count = dict
+                .get(b"Count")
+                .ok()
+                .and_then(|o| o.as_i64().ok())
+                .unwrap_or(0);
+            if let Some(first) = first {
+                outlines.push(((first.0 + offset, first.1), count));
+            }
+        }
 
         // Pages keep their own dictionaries, but the tree they used to hang
         // from is thrown away, so anything they inherited from it has to be
@@ -428,6 +605,7 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
                     }
                 }
             }
+            resolve_links(&mut object, &names, None);
             shift_refs(&mut object, offset);
             out.objects.insert((id.0 + offset, id.1), object);
         }
@@ -456,12 +634,98 @@ pub fn merge(sources: Vec<Document>) -> Result<Document> {
         }),
     );
 
-    let catalog_id = out.add_object(dictionary! {
+    let mut catalog = dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
-    });
+    };
+    if let Some(outlines_id) = rebuild_outlines(&mut out, &outlines) {
+        catalog.set("Outlines", outlines_id);
+    }
+    let catalog_id = out.add_object(catalog);
     out.trailer.set("Root", catalog_id);
     Ok(out)
+}
+
+/// Splice the top level of every source outline into one tree.
+///
+/// The items themselves are ordinary objects and were copied with the rest; all
+/// that is missing is a root that owns them, the links between the chains, and
+/// a `/Parent` pointing at that root instead of at the old one.
+fn rebuild_outlines(out: &mut Document, chains: &[(ObjectId, i64)]) -> Option<ObjectId> {
+    let mut valid: Vec<(ObjectId, ObjectId, i64)> = Vec::new();
+    for (first, count) in chains {
+        if !out.objects.contains_key(first) {
+            continue;
+        }
+        let mut current = Some(*first);
+        let mut previous: Option<ObjectId> = None;
+        while let Some(id) = current {
+            let next = out
+                .get_dictionary(id)
+                .ok()
+                .and_then(|dict| dict.get(b"Next").ok())
+                .and_then(|next| next.as_reference().ok());
+            previous = Some(id);
+            current = next;
+        }
+        if let Some(last) = previous {
+            valid.push((*first, last, *count));
+        }
+    }
+    if valid.is_empty() {
+        return None;
+    }
+
+    let root = (out.max_id + 1, 0);
+    out.max_id += 1;
+    let mut total = 0i64;
+    let mut previous_last: Option<ObjectId> = None;
+    for (first, last, count) in &valid {
+        if let Ok(dict) = out.get_dictionary_mut(*first) {
+            dict.remove(b"Prev");
+            dict.set("Parent", root);
+        }
+        if let Ok(dict) = out.get_dictionary_mut(*last) {
+            dict.remove(b"Next");
+            dict.set("Parent", root);
+        }
+        if let Some(previous) = previous_last {
+            if let Ok(dict) = out.get_dictionary_mut(previous) {
+                dict.set("Next", *first);
+            }
+            if let Ok(dict) = out.get_dictionary_mut(*first) {
+                dict.set("Prev", previous);
+            }
+        }
+        previous_last = Some(*last);
+        total += *count;
+    }
+
+    let first = valid[0].0;
+    let last = previous_last?;
+    // Every top level item needs the new root as its parent, not just the ends.
+    let mut current = Some(first);
+    while let Some(id) = current {
+        let next = out
+            .get_dictionary(id)
+            .ok()
+            .and_then(|dict| dict.get(b"Next").ok())
+            .and_then(|next| next.as_reference().ok());
+        if let Ok(dict) = out.get_dictionary_mut(id) {
+            dict.set("Parent", root);
+        }
+        current = next;
+    }
+    out.objects.insert(
+        root,
+        Object::Dictionary(dictionary! {
+            "Type" => "Outlines",
+            "First" => first,
+            "Last" => last,
+            "Count" => total,
+        }),
+    );
+    Some(root)
 }
 
 /// Add `offset` to every object number inside `object`, so references keep
@@ -534,6 +798,11 @@ fn extract_from(sources: &[Document], keys: &[(usize, ObjectId)]) -> Document {
         .map(|d| d.version.clone())
         .unwrap_or_else(|| "1.5".to_string());
     let mut out = Document::with_version(version);
+    let names: Vec<BTreeMap<Vec<u8>, Object>> = sources.iter().map(named_destinations).collect();
+    let mut kept_by_source: BTreeMap<usize, BTreeSet<ObjectId>> = BTreeMap::new();
+    for (source, id) in keys {
+        kept_by_source.entry(*source).or_default().insert(*id);
+    }
     let mut next: u32 = 1;
     let pages_id = (next, 0);
     next += 1;
@@ -566,6 +835,9 @@ fn extract_from(sources: &[Document], keys: &[(usize, ObjectId)]) -> Document {
                 dict.set(key, value);
             }
         }
+        // Before the references are remapped, turn any named destination into
+        // the page it names, and drop it if that page is not coming along.
+        resolve_links(&mut object, &names[key.0], kept_by_source.get(&key.0));
         remap(&mut object, key.0, &mut map, &mut queue, &mut next);
         out.objects.insert(new, object);
     }

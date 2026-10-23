@@ -124,12 +124,16 @@ trusting the writer:
 | A page number past the end is refused, nothing written | `assemble_refuses_a_page_that_does_not_exist` |
 | `info` reports the true page count | `info_reports_page_count` |
 
-`tests/edge_cases.rs` adds 35 more, against page trees written as raw bytes
+`tests/edge_cases.rs` adds 40 more, against page trees written as raw bytes
 because the shapes that break page surgery are the ones a library's own writer
 never produces: attributes inherited from a `Pages` node, a `/Parent` cycle, a
 `/Count` that lies, the same page object listed twice in `/Kids`, a zero page
 document, an encrypted file, and a page asked for twice. Every output is walked
 object by object to prove it holds no reference to anything that is not there.
+Links get the same treatment: a named destination has to come out of a merge
+pointing at a page, bookmarks from several inputs have to end up in one chain
+whose ends agree, and a link that names a page the output does not contain has
+to be dropped rather than left dangling.
 
 The command line is tested the same way: flags before or after the file, a file
 named `-like-a-flag` after `--`, a path with a colon in it, a path that is not
@@ -160,7 +164,10 @@ files takes about 0.2 seconds, where deleting pages one at a time took over six
 minutes.
 
 `merge` keeps everything from every input and builds one page tree over all of
-them, so links between the merged files' own pages keep working.
+them, so links between the merged files' own pages keep working. The bookmarks
+of every input are spliced into one outline, and a link that went through a
+named destination is rewritten to point at the page the name resolved to, so a
+merged LaTeX paper keeps both its contents list and its cross references.
 
 Both rebuilds flatten the tree, so anything a page was inheriting from a `Pages`
 node above it, its resources, media box, crop box and rotation, is written onto
@@ -175,10 +182,10 @@ opens blank, or at the wrong size.
   damaged files that parse only by guesswork: a stream whose `/Length` is
   missing or does not match the bytes that were read would be copied without
   its content, so the whole command stops instead.
-- **No catalogue beyond the pages.** `merge` builds one page tree and one
-  catalogue, so a named destination tree or an outline that lived in a source
-  catalogue does not travel with it. Links that used one become inert; nothing
-  is left pointing at a page that is not there.
+- **No forms, metadata or document level scripts.** `merge` builds one
+  catalogue, so `/AcroForm`, `/Metadata` and JavaScript from the inputs do not
+  travel. Bookmarks and internal links do: names are resolved into page
+  references, and nothing is left pointing at a page that is not there.
 - **Nothing is written in place.** Output goes to a temporary file beside the
   destination, is read back and checked (it must load, its catalogue must own a
   page tree, every reference in it must land on an object), and only then is it
@@ -188,7 +195,10 @@ opens blank, or at the wrong size.
   the size of the input apart from the removed pages.
 - **Links into removed pages are dropped.** A file whose links pointed at page 12
   will lose those links if page 12 is gone; keeping them would keep the warnings.
-- **No bookmarks or forms support** beyond what survives untouched.
+- **Bookmarks survive a merge, not an extraction.** `select`, `split` and
+  `assemble` build a document from pages alone, so the outline that used to
+  describe the whole file is not carried; a bookmark pointing at a page that is
+  still there would be a guess about what the new document is called.
 - **Text extraction is not exposed.** `info` reads structure only.
 
 ## Why another PDF tool

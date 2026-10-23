@@ -40,14 +40,12 @@ for input in "$@"; do
     # every key it knows, so a page without /Parent or a stale reference shows
     # up here even though a reader would tolerate it.
     if command -v qpdf >/dev/null; then
-      if report=$(qpdf --check "$out" 2>&1); then
-        :
-      elif printf '%s' "$report" | grep -q "Permission denied"; then
-        : # qpdf cannot open files in this directory; not a verdict on the file
-      else
-        echo "  FAIL  qpdf --check rejects $(basename "$out")"
-        status=1
-      fi
+      # `case`, not `grep -q`: with pipefail a match can kill qpdf with SIGPIPE
+      # and turn a pass into a failure.
+      report=$(qpdf --check "$out" 2>&1) || case "$report" in
+        *"Permission denied"*) : ;; # qpdf cannot open this directory, not a verdict
+        *) echo "  FAIL  qpdf --check rejects $(basename "$out")"; status=1 ;;
+      esac
     fi
   done
 
@@ -65,7 +63,8 @@ for input in "$@"; do
   echo "  parts: $(find "$work/$name-parts" -name '*.pdf' | wc -l) files, warnings checked"
 done
 
-# With two or more inputs, also assemble a mixed document and check that too.
+# With two or more inputs, also assemble and merge mixed documents and check
+# both: merge is the operation that has to splice page trees and outlines.
 if [ "$#" -ge 2 ]; then
   first_file=$1
   "$binary" assemble -o "$work/mixed.pdf" "$first_file:1-2" "$2:1" "$first_file:$first_total"
@@ -74,6 +73,20 @@ if [ "$#" -ge 2 ]; then
     status=1
   else
     echo "assemble: clean, $(pdfinfo "$work/mixed.pdf" | awk '/^Pages:/ {print $2}') pages"
+  fi
+
+  "$binary" merge -o "$work/merged.pdf" "$1" "$2"
+  if pdfinfo "$work/merged.pdf" 2>&1 | grep -qi "syntax warning"; then
+    echo "merge: FAIL  poppler complains about the merged document"
+    status=1
+  elif command -v qpdf >/dev/null; then
+    report=$(qpdf --check "$work/merged.pdf" 2>&1) || case "$report" in
+      *"Permission denied"*) : ;;
+      *) echo "merge: FAIL  qpdf --check rejects the merged document"; status=1 ;;
+    esac
+    echo "merge: $(pdfinfo "$work/merged.pdf" | awk '/^Pages:/ {print $2}') pages, checked"
+  else
+    echo "merge: clean, $(pdfinfo "$work/merged.pdf" | awk '/^Pages:/ {print $2}') pages"
   fi
 fi
 

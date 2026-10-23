@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use pdfsurgeon::lopdf::ObjectId;
 use pdfsurgeon::{Document, Error, PageSpec, Piece};
 
 fn scratch(name: &str) -> PathBuf {
@@ -745,6 +746,179 @@ fn merge_keeps_page_content_but_not_the_catalogue_name_tree() {
     assert!(page_dict_text(&reloaded, 2).contains("second page"));
     assert!(page_dict_text(&reloaded, 3).contains("first page"));
     assert!(page_dict_text(&reloaded, 4).contains("second page"));
+}
+
+fn annots_of(doc: &Document, page: u32) -> Vec<ObjectId> {
+    let id = doc.get_pages()[&page];
+    doc.get_dictionary(id)
+        .unwrap()
+        .get(b"Annots")
+        .ok()
+        .and_then(|annots| annots.as_array().ok())
+        .map(|annots| {
+            annots
+                .iter()
+                .filter_map(|a| a.as_reference().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The page a link annotation points at, following an explicit `/Dest` or a
+/// `/GoTo` action's `/D`.
+fn link_target(doc: &Document, annot: ObjectId) -> Option<ObjectId> {
+    let dict = doc.get_dictionary(annot).ok()?;
+    let destination = dict.get(b"Dest").ok().cloned().or_else(|| {
+        let action = dict.get(b"A").ok()?.as_reference().ok()?;
+        doc.get_dictionary(action).ok()?.get(b"D").ok().cloned()
+    })?;
+    let array = doc
+        .get_object(match destination {
+            lopdf::Object::Reference(id) => id,
+            other => return other.as_array().ok().and_then(|a| a[0].as_reference().ok()),
+        })
+        .ok()?;
+    array.as_array().ok()?.first()?.as_reference().ok()
+}
+
+#[test]
+fn merge_turns_named_destinations_into_page_links() {
+    let dir = scratch("named-merge");
+    let file = dir.join("linked.pdf");
+    linked_document(&file);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&file).unwrap(),
+        Document::load(&file).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+
+    // The link that used a name in the first copy now points at the second page
+    // of the first copy; in the second copy, at its own second page.
+    let pages = merged.get_pages();
+    for (page, expected) in [(1u32, 2u32), (3, 4)] {
+        let targets: Vec<_> = annots_of(&merged, page)
+            .into_iter()
+            .filter_map(|annot| link_target(&merged, annot))
+            .collect();
+        assert!(
+            targets.contains(&pages[&expected]),
+            "page {page} should link to page {expected}, got {targets:?}"
+        );
+    }
+}
+
+#[test]
+fn merge_joins_the_outlines_of_every_input() {
+    let dir = scratch("outline-merge");
+    let file = dir.join("linked.pdf");
+    linked_document(&file);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&file).unwrap(),
+        Document::load(&file).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+
+    let catalog = merged.catalog().unwrap();
+    let root = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+    let root_dict = merged.get_dictionary(root).unwrap();
+    assert_eq!(root_dict.get(b"Count").unwrap().as_i64().unwrap(), 2);
+
+    let first = root_dict.get(b"First").unwrap().as_reference().unwrap();
+    let last = root_dict.get(b"Last").unwrap().as_reference().unwrap();
+    assert_ne!(first, last, "two inputs should give two bookmarks");
+
+    let first_dict = merged.get_dictionary(first).unwrap();
+    let last_dict = merged.get_dictionary(last).unwrap();
+    assert_eq!(
+        first_dict.get(b"Parent").unwrap().as_reference().unwrap(),
+        root
+    );
+    assert_eq!(
+        last_dict.get(b"Parent").unwrap().as_reference().unwrap(),
+        root
+    );
+    assert!(
+        first_dict.get(b"Prev").is_err(),
+        "first bookmark has no Prev"
+    );
+    assert!(last_dict.get(b"Next").is_err(), "last bookmark has no Next");
+    assert_eq!(
+        first_dict.get(b"Next").unwrap().as_reference().unwrap(),
+        last,
+        "the chains should be joined"
+    );
+
+    let pages = merged.get_pages();
+    assert_eq!(
+        link_target(&merged, first),
+        Some(pages[&1]),
+        "first bookmark should open the first page"
+    );
+    assert_eq!(
+        link_target(&merged, last),
+        Some(pages[&3]),
+        "second bookmark should open the second copy's first page"
+    );
+}
+
+#[test]
+fn merge_adds_no_outline_when_no_input_has_one() {
+    let dir = scratch("outline-none");
+    let a = dir.join("a.pdf");
+    let b = dir.join("b.pdf");
+    nested_tree(&a);
+    nested_tree(&b);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&a).unwrap(),
+        Document::load(&b).unwrap(),
+    ])
+    .unwrap();
+    assert!(merged.catalog().unwrap().get(b"Outlines").is_err());
+    assert_no_dangling_references(&merged);
+}
+
+#[test]
+fn merge_keeps_the_outline_an_input_does_have() {
+    let dir = scratch("outline-half");
+    let with = dir.join("with.pdf");
+    let without = dir.join("without.pdf");
+    linked_document(&with);
+    nested_tree(&without);
+
+    let merged = pdfsurgeon::merge(vec![
+        Document::load(&with).unwrap(),
+        Document::load(&without).unwrap(),
+    ])
+    .unwrap();
+    assert_no_dangling_references(&merged);
+    let catalog = merged.catalog().unwrap();
+    let root = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+    let dict = merged.get_dictionary(root).unwrap();
+    assert_eq!(dict.get(b"Count").unwrap().as_i64().unwrap(), 1);
+    let first = dict.get(b"First").unwrap().as_reference().unwrap();
+    assert_eq!(first, dict.get(b"Last").unwrap().as_reference().unwrap());
+}
+
+#[test]
+fn select_drops_a_named_destination_that_points_at_a_removed_page() {
+    let dir = scratch("named-select");
+    let file = dir.join("linked.pdf");
+    linked_document(&file);
+
+    let doc = Document::load(&file).unwrap();
+    let out = pdfsurgeon::select(&doc, &[1]).unwrap();
+    assert_no_dangling_references(&out);
+
+    // Page two is gone, so the link that named it cannot resolve; it is dropped
+    // rather than left pointing at a name nobody defines.
+    for annot in annots_of(&out, 1) {
+        assert_eq!(link_target(&out, annot), None, "stale link survived");
+    }
 }
 
 // ---------------------------------------------------------------------------
