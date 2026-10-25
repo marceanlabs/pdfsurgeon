@@ -18,15 +18,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+
+      # Installed with the stable cargo: cargo-fuzz compiles fine there and is
+      # invoked below through the nightly toolchain, which it needs to fuzz.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
 
       - name: Seed corpus from the test fixtures
         run: |
           mkdir -p fuzz/corpus/parse
           cp tests/fixtures/*.pdf fuzz/corpus/parse/ || true
+          ls -1 fuzz/corpus/parse | wc -l
 
       - name: Fuzz
-        run: cargo fuzz run parse -- -max_total_time=${{ github.event.inputs.seconds || '900' }} -rss_limit_mb=4096
+        run: cargo +nightly fuzz run parse -- -max_total_time=${{ github.event.inputs.seconds || '900' }} -rss_limit_mb=4096
 
       - name: Keep the crash
         if: failure()
