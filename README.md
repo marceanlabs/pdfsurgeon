@@ -8,10 +8,14 @@
 Page level surgery for PDF files, in Rust. Merge, split, select and rotate, and
 leave the rest of the document alone.
 
-The pitch is narrow and specific: **the output does not make other PDF tools
-warn**. Page removal in most libraries leaves dangling destinations behind, and
-readers then report things like `Annotation destination array is too short`. This
-one cleans up after itself.
+The scope is narrow and specific: **page removal does not leave dangling
+destinations behind**. Most libraries leave them, and readers then report things
+like `Annotation destination array is too short`. This one cleans up after
+itself, and every output reads with no syntax warning in poppler.
+
+qpdf 12.3.2 is stricter than poppler, and today it reports an unsorted name tree
+on our output. That is a defect here, not a design choice; it is written down in
+`notes/benchmark-review-2026-10-25.md` with the command that shows it.
 
 ## Install
 
@@ -32,6 +36,10 @@ of two runs, warm cache, same machine, against `qpdf 12.3.2` and `mutool 1.27`:
 | Merge two copies (1,940 pages) | 0.98 s | 6.06 s | 1.32 s |
 | Select 3 pages | 0.27 s | 2.27 s | 0.69 s |
 | Rotate every page (`mutool` has no per-page rotate) | 0.37 s | 2.55 s | 0.01 s |
+
+Split is the exception and it is a defect, not a trade: it writes 1.3 GB of page
+files for this document where qpdf writes 38 MB, and that write is most of why
+the split row is slower than qpdf's. Merge and rotate are the rows that win.
 
 The work here is bulk page surgery and that is where it wins. A single page edit
 against a large file is dominated by parsing and writing the whole document,
