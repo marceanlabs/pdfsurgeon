@@ -172,6 +172,27 @@ be attached to its page. `scripts/check_forms.py` builds the forms with
 
 `scripts/check_with_poppler.sh` repeats those checks on any file you point it at.
 
+## Fuzzing
+
+PDF is a hostile input by default, so the parser path is fuzzed rather than only
+tested:
+
+```console
+$ cargo install cargo-fuzz          # once, plus: rustup toolchain install nightly
+$ mkdir -p fuzz/corpus/parse && cp tests/fixtures/*.pdf fuzz/corpus/parse/
+$ cargo +nightly fuzz run parse -- -max_total_time=900
+```
+
+The target parses arbitrary bytes with the same `lopdf` the binary uses, then
+runs every operation this crate exposes on the result: info, split, select with
+valid and invalid page lists, rotate at two angles, merge with a write back out,
+and assemble.
+
+`.github/workflows/fuzz.yml` runs it nightly for fifteen minutes and uploads the
+crashing input when one appears. A crash is first reproduced, then minimised with
+`cargo fuzz tmin`, then fixed here or reported to `lopdf`, and either way it
+becomes a regression test in `tests/edge_cases.rs`.
+
 ## How it works
 
 `select` and `split` do not delete pages out of the input. They build a new
