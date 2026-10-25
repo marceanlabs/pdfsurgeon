@@ -58,10 +58,23 @@ qpdf could not open the input under the agent's scratch tree and exited in
 milliseconds. `scripts/bench.sh` now works in `/tmp` and treats a non-zero exit as
 fatal, so that cannot be published again.
 
-## Order of work
+## What was done about it
 
-1. Fix the name tree ordering. It is the pitch, and right now a second opinion tool
-   proves the pitch wrong.
-2. Fix what makes a single page 1.3 MB.
-3. Re-measure, then rewrite the Speed section with these numbers and the script
-   that produces them (`scripts/bench.sh`).
+1. **Name tree keys are sorted** when the tree is written. `qpdf --check` now reports
+   nothing on merge, select, rotate or split output, where before every command
+   produced the warning.
+2. **A part is a page, not the document.** Attachments travel only when every page
+   came along; a split part and a partial selection carry none. One page went from
+   1.3 MB to 34 KB, a 970 page split from 1.3 GB to 36 MB, and a three page
+   selection from 1.4 MB to 77 KB.
+3. **Split parts are built on every core**, in chunks so the peak stays bounded:
+   5.97 s to 1.45 s, peak memory 460 MB to 235 MB. The chunked API is
+   `split_into`, which hands each part to a sink instead of returning all of them.
+
+## Where the floor is
+
+Select is still the one row that loses, and it cannot be fixed here: `pdfsurgeon
+info` on the same file takes 0.36 s, and select takes 0.35 s, so the whole command
+is the parse. `mutool` streams pages rather than building an object model, which is
+why it wins a single page edit. Beating it means a different parser, not a
+different loop.
