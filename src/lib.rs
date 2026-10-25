@@ -461,7 +461,7 @@ pub fn split(doc: &Document) -> Result<Vec<Document>> {
         // No bookmarks in a one page file: the only ones left would point at
         // the page they are listed in, and walking the outline tree once per
         // page is a quarter of the time split spends.
-        pages.push(extract_with_names(source, &[(0, *id)], names, false));
+        pages.push(extract_with_names(source, &[(0, *id)], names, false, false));
     }
     Ok(pages)
 }
@@ -891,7 +891,7 @@ pub fn rotate(doc: &mut Document, pages: &[u32], angle: i64) -> Result<()> {
 /// can exist in the result.
 fn extract_from(sources: &[Document], keys: &[(usize, ObjectId)]) -> Document {
     let names: Vec<BTreeMap<Vec<u8>, Object>> = sources.iter().map(named_destinations).collect();
-    extract_with_names(sources, keys, &names, true)
+    extract_with_names(sources, keys, &names, true, true)
 }
 
 /// The body of [`extract_from`], with the named destinations already read so a
@@ -901,6 +901,7 @@ fn extract_with_names(
     keys: &[(usize, ObjectId)],
     names: &[BTreeMap<Vec<u8>, Object>],
     bookmarks: bool,
+    files: bool,
 ) -> Document {
     let version = sources
         .first()
@@ -1014,9 +1015,17 @@ fn extract_with_names(
                 labels.push((position as u32, text.clone()));
             }
         }
-        for (name, filespec) in embedded_files(&sources[0]) {
-            if let Some(id) = copy_filespec(&sources[0], &mut out, filespec) {
-                attached.push((name, id));
+        // An attachment describes the document it came from. A split part is a
+        // page, and a selection of some pages is a different document, so the
+        // file would be a false statement about either. It travels only when
+        // every page came along, which is also what stops a three page
+        // selection from weighing as much as the file it came out of.
+        let whole_document = keys.len() == sources[0].get_pages().len();
+        if files && whole_document {
+            for (name, filespec) in embedded_files(&sources[0]) {
+                if let Some(id) = copy_filespec(&sources[0], &mut out, filespec) {
+                    attached.push((name, id));
+                }
             }
         }
     }
@@ -1997,12 +2006,19 @@ fn write_embedded_files(out: &mut Document, files: &[(Vec<u8>, ObjectId)]) -> Op
         return None;
     }
     let mut taken: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let mut pairs: Vec<Object> = Vec::with_capacity(files.len() * 2);
+    let mut entries: Vec<(Vec<u8>, ObjectId)> = Vec::with_capacity(files.len());
     for (name, id) in files {
         let unique = unique_attachment_name(&taken, name);
         taken.insert(unique.clone());
-        pairs.push(Object::String(unique, lopdf::StringFormat::Literal));
-        pairs.push(Object::Reference(*id));
+        entries.push((unique, *id));
+    }
+    // A name tree's keys must be sorted: readers binary search them, and qpdf
+    // reports "keys are not sorted" and repairs the file when they are not.
+    entries.sort();
+    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
+    for (name, id) in entries {
+        pairs.push(Object::String(name, lopdf::StringFormat::Literal));
+        pairs.push(Object::Reference(id));
     }
     let tree = out.add_object(dictionary! { "Names" => pairs });
     Some(out.add_object(dictionary! { "EmbeddedFiles" => tree }))

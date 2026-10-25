@@ -2063,7 +2063,18 @@ fn attachments_travel_with_the_document() {
     rich_document(&file);
 
     let doc = Document::load(&file).unwrap();
-    let picked = pdfsurgeon::select(&doc, &[1]).unwrap();
+
+    // A selection of some pages is a different document, so the attachment that
+    // describes the original does not come along and the output stays small.
+    let part = pdfsurgeon::select(&doc, &[1]).unwrap();
+    assert_no_dangling_references(&part);
+    assert!(
+        part.catalog().unwrap().get(b"Names").is_err(),
+        "a three page selection must not carry the whole document's attachment"
+    );
+
+    // Keep every page and the document is the document, attachment and all.
+    let picked = pdfsurgeon::select(&doc, &[1, 2, 3, 4]).unwrap();
     assert_no_dangling_references(&picked);
     let names = resolve(picked.catalog().unwrap().get(b"Names").unwrap(), &picked);
     let tree = names.get(b"EmbeddedFiles").unwrap().as_reference().unwrap();
@@ -2099,8 +2110,10 @@ fn attachments_travel_with_the_document() {
     let tree = merged.get_dictionary(tree).unwrap();
     let pairs = tree.get(b"Names").unwrap().as_array().unwrap();
     assert_eq!(pairs.len(), 4, "two attachments, one name entry each");
-    assert_eq!(pairs[0].as_str().unwrap(), b"readme.txt");
-    assert_eq!(pairs[2].as_str().unwrap(), b"readme (2).txt");
+    // A name tree is searched by binary search, so its keys are written sorted.
+    // " (" sorts before "." in byte order, which puts the renamed copy first.
+    assert_eq!(pairs[0].as_str().unwrap(), b"readme (2).txt");
+    assert_eq!(pairs[2].as_str().unwrap(), b"readme.txt");
 }
 
 // ---------------------------------------------------------------------------

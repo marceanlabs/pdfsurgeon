@@ -13,9 +13,9 @@ destinations behind**. Most libraries leave them, and readers then report things
 like `Annotation destination array is too short`. This one cleans up after
 itself, and every output reads with no syntax warning in poppler.
 
-qpdf 12.3.2 is stricter than poppler, and today it reports an unsorted name tree
-on our output. That is a defect here, not a design choice; it is written down in
-`notes/benchmark-review-2026-10-25.md` with the command that shows it.
+`qpdf --check` agrees: it reports no warning on the output of any command, which
+is the check that matters, because qpdf is stricter than poppler about the parts
+a reader is allowed to repair silently.
 
 ## Install
 
@@ -27,25 +27,31 @@ Or take a prebuilt binary from the [releases page](https://github.com/marceanlab
 
 ## Speed
 
-Measured on a 970 page, 8.6 MB document (RFC 9110 concatenated five times), best
-of two runs, warm cache, same machine, against `qpdf 12.3.2` and `mutool 1.27`:
+Measured on a 970 page, 13 MB document (RFC 9110 merged with itself five times),
+median of three runs, same machine, against `qpdf 12.3.2` and `mutool 1.27`,
+25 October 2026. `scripts/bench.sh` rebuilds the document and reproduces the
+table; it treats a failed command as fatal, so a broken column cannot be
+published as a fast one.
 
 | Operation | pdfsurgeon | qpdf | mutool |
 |---|---|---|---|
-| Split every page into its own file | 0.89 s | 4.81 s | not supported |
-| Merge two copies (1,940 pages) | 0.98 s | 6.06 s | 1.32 s |
-| Select 3 pages | 0.27 s | 2.27 s | 0.69 s |
-| Rotate every page (`mutool` has no per-page rotate) | 0.37 s | 2.55 s | 0.01 s |
+| Split every page into its own file | 3.21 s, 36 MB of output | 3.59 s, 38 MB | not supported |
+| Merge two copies (1,940 pages) | 1.10 s | 5.28 s | 2.54 s |
+| Select 3 pages | 0.36 s, 77 KB | 0.28 s, 90 KB | 0.09 s, 35 KB |
+| Rotate every page (`mutool` has no per-page rotate) | 0.52 s | 3.18 s | not supported |
 
-Split is the exception and it is a defect, not a trade: it writes 1.3 GB of page
-files for this document where qpdf writes 38 MB, and that write is most of why
-the split row is slower than qpdf's. Merge and rotate are the rows that win.
+Bulk page surgery is where it wins: merge by five times over qpdf, rotate by six,
+and split now that it writes the pages it was asked for rather than a copy of
+every attachment.
 
-The work here is bulk page surgery and that is where it wins. A single page edit
-against a large file is dominated by parsing and writing the whole document,
-which `mutool` avoids by not going through a general object model, so it stays
-ahead on that one. `cargo run --release --example phases -- <file.pdf>` repeats
-the timing.
+Select is the row it loses, and the reason is the parser rather than this code:
+`pdfsurgeon info` on the same file takes 0.36 s, and that is the whole of the
+select time. `mutool` streams pages instead of building an object model, so it
+does a single page edit faster than anything that parses the document first. This
+tool pays that parse for what it does with the model: page trees rebuilt, links
+resolved, forms and bookmarks carried.
+
+`cargo run --release --example phases -- <file.pdf>` repeats the timing.
 
 ```
 $ pdfsurgeon info report.pdf
@@ -163,7 +169,8 @@ Beyond the test suite, the tool was checked against real files from two
 different producers, a 15 page paper and the 194 page RFC 9110, with poppler as
 an independent reader:
 
-- every output opens with no `Syntax Warning` from `pdfinfo`
+- every output opens with no `Syntax Warning` from `pdfinfo`, and no warning at
+  all from `qpdf --check`
 - text extracted from a selection is byte identical to the same page range
   extracted from the original
 - merging the 194 page RFC with the 15 page paper gives a clean 209 page file
@@ -270,9 +277,14 @@ whose entries all land inside those 40 pages.
   rest 1, 2, 3 keeps that numbering through a selection, a split and a merge;
   the tree is written out one page at a time so the text is reproduced exactly
   rather than re-derived.
-- **Attachments travel.** Embedded files are not page-bound, so they come with
-  the document. A merge that brings two files of the same name keeps both,
-  renaming the second `note (2).txt` rather than losing one.
+- **Attachments travel with the whole document, not with a part of it.** An
+  embedded file describes the document it was attached to, so it comes along
+  when every page does: a merge, an assemble of complete files, a selection that
+  keeps everything. A split part is one page, and a selection of three pages out
+  of a thousand is a different document, so neither carries an attachment that
+  would no longer be true. That is also what keeps a three page selection at
+  77 KB instead of the 1.4 MB it used to be. A merge that brings two files of the
+  same name keeps both, renaming the second `note (2).txt` rather than losing one.
 - **Accessibility tagging and layers do not travel.** A structure tree
   (`/StructTreeRoot`) describes the document it was built for, and layer
   membership lives in the content streams; rebuilding either is a different
