@@ -119,10 +119,18 @@ with tempfile.TemporaryDirectory() as work:
     writer.write(str(attached))
     check(bool(PdfReader(str(attached)).attachments), "fixture should carry an attachment")
 
-    picked_attached = work / "picked-attached.pdf"
-    run("select", attached, "--pages", "1", "-o", picked_attached)
-    kept = PdfReader(str(picked_attached)).attachments
-    check(list(kept) == ["note.txt"], f"select lost the attachment: {list(kept)}")
+    # An attachment describes the document it came from, so a selection of some
+    # pages does not carry it: the file would be a false statement about a part.
+    part_attached = work / "part-attached.pdf"
+    run("select", attached, "--pages", "1", "-o", part_attached)
+    check(not PdfReader(str(part_attached)).attachments,
+          "a partial selection should not carry the whole document's attachment")
+
+    # Keep every page and the attachment travels, unchanged.
+    kept_all = work / "kept-attached.pdf"
+    run("select", attached, "--pages", "1-2", "-o", kept_all)
+    kept = PdfReader(str(kept_all)).attachments
+    check(list(kept) == ["note.txt"], f"a selection of every page lost the attachment: {list(kept)}")
     check(kept["note.txt"][0] == b"attached note", "the attachment content changed")
 
     merged_attached = work / "merged-attached.pdf"
