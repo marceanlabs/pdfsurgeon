@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/pdfsurgeon.svg)](https://crates.io/crates/pdfsurgeon)
 [![downloads](https://img.shields.io/crates/d/pdfsurgeon.svg)](https://crates.io/crates/pdfsurgeon)
-[![ci](https://github.com/wlkr73/pdfsurgeon/actions/workflows/ci.yml/badge.svg)](https://github.com/wlkr73/pdfsurgeon/actions/workflows/ci.yml)
+[![ci](https://github.com/marceanlabs/pdfsurgeon/actions/workflows/ci.yml/badge.svg)](https://github.com/marceanlabs/pdfsurgeon/actions/workflows/ci.yml)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 
 Page level surgery for PDF files, in Rust. Merge, split, select and rotate, and
@@ -19,7 +19,7 @@ one cleans up after itself.
 cargo install pdfsurgeon
 ```
 
-Or take a prebuilt binary from the [releases page](https://github.com/wlkr73/pdfsurgeon/releases) (Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64).
+Or take a prebuilt binary from the [releases page](https://github.com/marceanlabs/pdfsurgeon/releases) (Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64).
 
 ## Speed
 
