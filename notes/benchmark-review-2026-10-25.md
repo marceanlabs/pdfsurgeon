@@ -40,7 +40,7 @@ most of why our split is now slower than qpdf's.
 
 | Operation | pdfsurgeon | qpdf | mutool |
 |---|---|---|---|
-| Split every page | 4.31 s | 3.59 s | not supported |
+| Split every page | 4.31 s to 5.97 s across runs | 3.59 s to 3.65 s | not supported |
 | Merge two copies (1940 pages) | 1.06 s | 5.28 s | 2.52 s |
 | Select 3 pages | 0.33 s | 0.32 s | 0.09 s |
 | Rotate every page | 0.53 s | 3.10 s | not supported |
@@ -48,6 +48,15 @@ most of why our split is now slower than qpdf's.
 The old README numbers (0.89 s split against qpdf's 4.81 s, and 2.27 s for a three
 page select) do not reproduce on this document at all. Whatever produced them,
 they cannot be published again.
+
+The split row is disk-bound and moves between 4.3 s and 6.0 s on the same machine.
+A single number understates that; the README carries the size defect instead,
+which does not move.
+
+A run whose qpdf column reads 0.01 s to 0.02 s is a failed run, not a fast one:
+qpdf could not open the input under the agent's scratch tree and exited in
+milliseconds. `scripts/bench.sh` now works in `/tmp` and treats a non-zero exit as
+fatal, so that cannot be published again.
 
 ## Order of work
 
