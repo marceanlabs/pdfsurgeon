@@ -35,15 +35,22 @@ published as a fast one.
 
 | Operation | pdfsurgeon | qpdf | mutool |
 |---|---|---|---|
-| Split every page into its own file | 1.45 s, 36 MB of output | 3.69 s, 38 MB | not supported |
-| Merge two copies (1,940 pages) | 1.11 s | 5.13 s | 2.43 s |
-| Select 3 pages | 0.35 s, 77 KB | 0.29 s, 90 KB | 0.10 s, 35 KB |
-| Rotate every page (`mutool` has no per-page rotate) | 0.56 s | 3.24 s | not supported |
+| Split every page into its own file | 1.02 s, 36 MB of output | 3.71 s, 38 MB | not supported |
+| Merge two copies (1,940 pages) | 0.75 s | 5.36 s | 2.60 s |
+| Select 3 pages | 0.23 s, 77 KB | 0.26 s, 90 KB | 0.11 s, 35 KB |
+| Rotate every page (`mutool` has no per-page rotate) | 0.38 s | 3.13 s | not supported |
 
-Bulk page surgery is where it wins: merge by four and a half times over qpdf,
-rotate by nearly six, and split by two and a half now that it writes the pages it
-was asked for rather than a copy of every attachment, and builds them on every
-core at once.
+Bulk page surgery is where it wins: merge by seven times over qpdf, rotate by
+eight, split by three and a half, and select now edges qpdf as well.
+
+Two things did most of that. Split writes the pages it was asked for rather than a
+copy of every attachment, and builds them on every core at once. And the binary
+links mimalloc instead of glibc's allocator: parsing allocates a dictionary and a
+buffer per object, and `perf` put a fifth of the run time in page faults caused by
+that churn. It is worth 30 to 40 per cent of the wall clock and costs about a
+quarter more peak memory (287 MB against 230 MB on this file). Build with
+`--no-default-features` to take the slower, smaller-memory version; a library user
+sets their own allocator and this does not apply.
 
 Select is the row it loses, and the reason is the parser rather than this code:
 `pdfsurgeon info` on the same file takes 0.36 s, and that is the whole of the
