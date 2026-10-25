@@ -14,3 +14,4 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 lopdf = "0.46.0"
+rayon = "1.12.0"

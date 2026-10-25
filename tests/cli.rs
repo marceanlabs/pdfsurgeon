@@ -336,3 +336,31 @@ fn assemble_refuses_a_page_that_does_not_exist() {
     assert!(!status.success());
     assert!(!out.exists());
 }
+
+#[test]
+fn split_into_hands_over_every_page_once_and_in_order() {
+    let dir = scratch("split-into");
+    let file = dir.join("four.pdf");
+    make_doc(&file, &["one", "two", "three", "four"]);
+    let doc = Document::load(&file).unwrap();
+
+    let mut seen: Vec<u32> = Vec::new();
+    pdfsurgeon::split_into(&doc, |page, part| {
+        assert_eq!(part.get_pages().len(), 1, "a part is one page");
+        seen.push(page);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, vec![1, 2, 3, 4]);
+
+    // A sink that refuses stops the run and says why.
+    let err = pdfsurgeon::split_into(&doc, |page, _| {
+        if page == 3 {
+            Err(std::io::Error::other("disk full"))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("disk full"), "got {err}");
+}

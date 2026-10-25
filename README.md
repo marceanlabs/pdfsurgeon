@@ -35,14 +35,15 @@ published as a fast one.
 
 | Operation | pdfsurgeon | qpdf | mutool |
 |---|---|---|---|
-| Split every page into its own file | 3.21 s, 36 MB of output | 3.59 s, 38 MB | not supported |
-| Merge two copies (1,940 pages) | 1.10 s | 5.28 s | 2.54 s |
-| Select 3 pages | 0.36 s, 77 KB | 0.28 s, 90 KB | 0.09 s, 35 KB |
-| Rotate every page (`mutool` has no per-page rotate) | 0.52 s | 3.18 s | not supported |
+| Split every page into its own file | 1.45 s, 36 MB of output | 3.69 s, 38 MB | not supported |
+| Merge two copies (1,940 pages) | 1.11 s | 5.13 s | 2.43 s |
+| Select 3 pages | 0.35 s, 77 KB | 0.29 s, 90 KB | 0.10 s, 35 KB |
+| Rotate every page (`mutool` has no per-page rotate) | 0.56 s | 3.24 s | not supported |
 
-Bulk page surgery is where it wins: merge by five times over qpdf, rotate by six,
-and split now that it writes the pages it was asked for rather than a copy of
-every attachment.
+Bulk page surgery is where it wins: merge by four and a half times over qpdf,
+rotate by nearly six, and split by two and a half now that it writes the pages it
+was asked for rather than a copy of every attachment, and builds them on every
+core at once.
 
 Select is the row it loses, and the reason is the parser rather than this code:
 `pdfsurgeon info` on the same file takes 0.36 s, and that is the whole of the

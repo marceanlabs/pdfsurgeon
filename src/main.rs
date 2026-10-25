@@ -390,11 +390,10 @@ fn cmd_split(path: &Path, out_dir: Option<PathBuf>, args: &Parsed) -> Res<()> {
     // Three digits reads well up to a few hundred pages; a document with more
     // pages than that gets the width it needs, so the files still sort.
     let width = page_width(total);
-    for (index, mut single) in pdfsurgeon::split(&source)?.into_iter().enumerate() {
-        let page = index as u32 + 1;
+    pdfsurgeon::split_into(&source, |page, mut single| {
         let name = format!("{stem}-{page:0width$}.pdf");
-        save(&mut single, &dir.join(name))?;
-    }
+        save(&mut single, &dir.join(name)).map_err(|err| std::io::Error::other(err.to_string()))
+    })?;
     Ok(())
 }
 

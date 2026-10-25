@@ -499,6 +499,7 @@ name = "pdfsurgeon"
 version = "0.10.1"
 dependencies = [
  "lopdf",
+ "rayon",
 ]
 
 [[package]]
