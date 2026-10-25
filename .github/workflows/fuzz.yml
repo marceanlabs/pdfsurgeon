@@ -1,0 +1,41 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz
+        default: "900"
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Seed corpus from the test fixtures
+        run: |
+          mkdir -p fuzz/corpus/parse
+          cp tests/fixtures/*.pdf fuzz/corpus/parse/ || true
+
+      - name: Fuzz
+        run: cargo fuzz run parse -- -max_total_time=${{ github.event.inputs.seconds || '900' }} -rss_limit_mb=4096
+
+      - name: Keep the crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            fuzz/artifacts/
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
