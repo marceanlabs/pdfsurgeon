@@ -1,7 +1,10 @@
 # pdfsurgeon
 
-Take pages out of a PDF, put PDFs together, or split one into many, and leave the
-rest of the document alone.
+[![crates.io](https://img.shields.io/crates/v/pdfsurgeon.svg)](https://crates.io/crates/pdfsurgeon)
+[![ci](https://github.com/marceanlabs/pdfsurgeon/actions/workflows/ci.yml/badge.svg)](https://github.com/marceanlabs/pdfsurgeon/actions/workflows/ci.yml)
+
+Take pages out of a PDF, put PDFs together, or split one into many, without
+breaking it.
 
 ```console
 $ pdfsurgeon select report.pdf --pages 1-3,7 -o extract.pdf
@@ -17,16 +20,34 @@ pdfsurgeon rebuilds those lists as it goes, which is what makes the output clean
 `qpdf --check`, an independent tool that is strict about PDF structure, reports no
 warning on the result of any command.
 
+## Table of Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [What it will not do](#what-it-will-not-do)
+- [Performance](#performance)
+- [Using it from Rust](#using-it-from-rust)
+- [Contributing](#contributing)
+- [Licence](#licence)
+
 ## Install
 
 ```console
 $ cargo install pdfsurgeon
 ```
 
-Prebuilt binaries for Linux, macOS and Windows are on the
-[releases page](https://github.com/marceanlabs/pdfsurgeon/releases).
+Building from source needs Rust 1.85 or newer. Prebuilt binaries are on the
+[releases page](https://github.com/marceanlabs/pdfsurgeon/releases):
 
-## Commands
+| Platform | Target |
+|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` |
+| macOS, Apple silicon | `aarch64-apple-darwin` |
+| macOS, Intel | `x86_64-apple-darwin` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+## Usage
 
 ```
 pdfsurgeon info <file>
@@ -49,23 +70,15 @@ $ pdfsurgeon assemble -o bid.pdf cover.pdf report.pdf:2-4 appendix.pdf
 
 That builds a bid out of the cover, pages 2 to 4 of the report, and the appendix.
 
-## How fast it is
+### Exit codes
 
-970 pages, 13 MB, median of three runs, against qpdf 12.3.2 and mutool 1.27.
-`scripts/bench.sh` rebuilds the document and reproduces the table.
+| Code | Meaning |
+|---|---|
+| 0 | it worked |
+| 1 | it did not, including a command line it could not read |
 
-| Operation | pdfsurgeon | qpdf | mutool |
-|---|---|---|---|
-| Split every page | 1.02 s, 36 MB | 3.71 s, 38 MB | not supported |
-| Merge 1,940 pages | 0.75 s | 5.36 s | 2.60 s |
-| Select 3 pages | 0.23 s, 77 KB | 0.26 s, 90 KB | 0.11 s, 35 KB |
-| Rotate every page | 0.38 s | 3.13 s | not supported |
-
-Selecting three pages is the one row where mutool is quicker, and the reason is
-worth knowing. mutool reads pages as a stream and never builds a picture of the
-whole document. pdfsurgeon builds one, because that is what lets it fix the links,
-bookmarks and form fields afterwards. The cost here is a fifth of a second, and it
-is what makes the output clean.
+Bad arguments and failed work share one code here. A script should check for zero
+rather than try to tell the two apart.
 
 ## What it will not do
 
@@ -89,6 +102,14 @@ flat.
 **Attachments.** A file attachment is only carried over when you keep every page.
 Otherwise it would be attached to a document it no longer describes.
 
+## Performance
+
+On a 970 page, 13 MB document, splitting every page takes 1.02 s against 3.71 s for
+qpdf 12.3.2, and merging 1,940 pages takes 0.75 s against 5.36 s. mutool is quicker
+at selecting three pages, and there is a real reason for that.
+
+The full table, the method and the reason are in [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Using it from Rust
 
 ```rust
@@ -103,8 +124,14 @@ Every command is a public function, every error is one `Error` enum, and
 `lopdf::Document` is re-exported so a caller cannot end up on a different version
 of it. The API docs are at <https://docs.rs/pdfsurgeon>.
 
-The test suite runs on every change, and a nightly job feeds the parser random and
-damaged files to check that it fails safely instead of crashing.
+## Contributing
+
+Questions and bug reports go in the [issues](https://github.com/marceanlabs/pdfsurgeon/issues).
+Please open one before writing a patch, since the scope here is narrow on purpose
+and a feature that falls outside it will be turned down whatever its quality.
+
+Security problems should go through [private reporting](https://github.com/marceanlabs/pdfsurgeon/security/advisories/new)
+rather than a public issue.
 
 ## Licence
 
