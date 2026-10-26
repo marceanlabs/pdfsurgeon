@@ -344,10 +344,7 @@ fn cmd_assemble(inputs: &[OsString], out: &Path, args: &Parsed) -> Res<()> {
             Some(spec) => PageSpec::parse(&spec, total)?.pages().to_vec(),
             None => (1..=total).collect(),
         };
-        pieces.push(Piece {
-            source: sources.len(),
-            pages,
-        });
+        pieces.push(Piece::new(sources.len(), pages));
         sources.push(doc);
     }
 
@@ -422,6 +419,7 @@ fn cmd_rotate(path: &Path, spec: &str, angle: i64, out: &Path, args: &Parsed) ->
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests may panic on a failed assertion")]
     use super::page_width;
 
     #[test]

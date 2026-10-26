@@ -32,6 +32,7 @@ pub use lopdf::Document;
 use lopdf::{Dictionary, Object, ObjectId, dictionary};
 
 /// Everything this crate can go wrong with.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
     /// The underlying PDF library refused the file or the operation.
@@ -408,12 +409,14 @@ impl PageSpec {
     }
 
     /// The page numbers, in the order they were written.
+    #[must_use]
     pub fn pages(&self) -> &[u32] {
         &self.pages
     }
 }
 
 /// What `pdfsurgeon info` reports.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Info {
     /// PDF version from the header, for example `1.7`.
@@ -427,6 +430,7 @@ pub struct Info {
 }
 
 /// Read the structure of a document without touching the page content.
+#[must_use]
 pub fn info(doc: &Document) -> Info {
     let pages = doc.get_pages();
     let page_size = pages.values().next().and_then(|id| {
@@ -539,6 +543,7 @@ pub fn select(doc: &Document, pages: &[u32]) -> Result<Document> {
 
 /// One slice of an [`assemble`] call: pages from the input at `source`, in the
 /// order given.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Piece {
     /// Index into the slice of documents passed to [`assemble`].
@@ -548,7 +553,14 @@ pub struct Piece {
 }
 
 impl Piece {
+    /// A piece made of `pages` (one based), taken from the document at `source`.
+    #[must_use]
+    pub fn new(source: usize, pages: Vec<u32>) -> Self {
+        Piece { source, pages }
+    }
+
     /// Every page of the document at `source`.
+    #[must_use]
     pub fn all(source: usize, total: u32) -> Self {
         Piece {
             source,
@@ -2489,6 +2501,7 @@ fn remap(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests may panic on a failed assertion")]
     use super::*;
 
     fn doc(labels: &[&str]) -> Document {
@@ -2579,16 +2592,7 @@ mod tests {
         let b = doc(&["b1", "b2"]);
         let out = assemble(
             &[a, b],
-            &[
-                Piece {
-                    source: 1,
-                    pages: vec![2],
-                },
-                Piece {
-                    source: 0,
-                    pages: vec![3, 1],
-                },
-            ],
+            &[Piece::new(1, vec![2]), Piece::new(0, vec![3, 1])],
         )
         .unwrap();
         assert_eq!(out.get_pages().len(), 3);

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, reason = "tests may panic on a failed assertion")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

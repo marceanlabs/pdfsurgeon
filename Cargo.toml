@@ -25,3 +25,20 @@ optional = true
 [features]
 default = ["mimalloc-alloc"]
 mimalloc-alloc = ["dep:mimalloc"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+wildcard_imports = "warn"
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
+missing_panics_doc = "warn"
+clone_on_ref_ptr = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

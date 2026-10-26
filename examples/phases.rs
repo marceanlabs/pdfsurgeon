@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unwrap_used,
+    reason = "a scratch example that panics on purpose"
+)]
+
 // Times the three phases of each operation separately, so optimisation can
 // target the part that actually costs.
 use std::time::Instant;
@@ -65,13 +70,7 @@ fn main() {
     let t = Instant::now();
     let mut mixed = pdfsurgeon::assemble(
         &[doc.clone(), doc.clone()],
-        &[
-            Piece {
-                source: 0,
-                pages: (1..=total).collect(),
-            },
-            Piece::all(1, total),
-        ],
+        &[Piece::new(0, (1..=total).collect()), Piece::all(1, total)],
     )
     .unwrap();
     let assemble_build = ms(t);

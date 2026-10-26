@@ -6,6 +6,8 @@
 //! `/Parent` cycles, a `/Count` that lies) are exactly the shapes lopdf's own
 //! writer never produces.
 
+#![allow(clippy::unwrap_used, reason = "tests may panic on a failed assertion")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -869,17 +871,7 @@ fn assemble_output_has_no_references_to_missing_objects() {
 
     let a = Document::load(&file).unwrap();
     let b = Document::load(&file).unwrap();
-    let out = pdfsurgeon::assemble(
-        &[a, b],
-        &[
-            Piece {
-                source: 1,
-                pages: vec![2],
-            },
-            Piece::all(0, 2),
-        ],
-    )
-    .unwrap();
+    let out = pdfsurgeon::assemble(&[a, b], &[Piece::new(1, vec![2]), Piece::all(0, 2)]).unwrap();
     assert_no_dangling_references(&out);
 }
 
@@ -1629,16 +1621,7 @@ fn assemble_from_two_forms_gives_every_field_a_unique_name() {
 
     let assembled = pdfsurgeon::assemble(
         &[Document::load(&a).unwrap(), Document::load(&b).unwrap()],
-        &[
-            Piece {
-                source: 0,
-                pages: vec![1],
-            },
-            Piece {
-                source: 1,
-                pages: vec![1],
-            },
-        ],
+        &[Piece::new(0, vec![1]), Piece::new(1, vec![1])],
     )
     .unwrap();
     assert_no_dangling_references(&assembled);
