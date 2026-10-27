@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # First of the month: a fresh lockfile, so upstream breakage is found by
+    # the calendar rather than by a user.
+    - cron: "0 6 1 * *"
 
 jobs:
   test:
@@ -24,6 +28,13 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils qpdf
           cargo build --release
           curl -sSL --max-time 120 -o sample.pdf https://www.rfc-editor.org/rfc/rfc9110.pdf
+          ./scripts/check_with_poppler.sh sample.pdf tests/fixtures/two-pages.pdf
+      - name: A fresh lockfile still passes
+        if: github.event_name == 'schedule'
+        run: |
+          cargo update
+          cargo test
+          cargo build --release
           ./scripts/check_with_poppler.sh sample.pdf tests/fixtures/two-pages.pdf
       - name: Check that forms stay fillable
         run: |
