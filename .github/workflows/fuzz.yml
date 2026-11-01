@@ -16,7 +16,7 @@ jobs:
   parse:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
 
       # Installed with the stable cargo: cargo-fuzz compiles fine there and is
@@ -39,7 +39,7 @@ jobs:
 
       - name: Keep the crash
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: |
