@@ -2350,6 +2350,13 @@ fn a_path_that_is_not_valid_utf8_still_opens() {
     name.push(OsString::from_vec(vec![0xff]));
     name.push(".pdf");
     let file = dir.join(&name);
+    // APFS rejects a name that is not valid UTF-8 before any program sees it (EILSEQ),
+    // so on macOS there is no such path to open. The behaviour this test pins is only
+    // reachable where the filesystem allows the name.
+    if std::fs::File::create(&file).is_err() {
+        eprintln!("skipping: this filesystem will not create a non-UTF-8 name");
+        return;
+    }
     nested_tree(&file);
 
     let status = Command::new(env!("CARGO_BIN_EXE_pdfsurgeon"))
